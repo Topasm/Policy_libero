@@ -41,8 +41,8 @@ def main():
 
     # --- Update cfg with dataset dimensions below ---
     # --- Dataset Setup ---
-    dataset_repo_id = "yongjincho/libero"
-    dataset_metadata = LeRobotDatasetMetadata(dataset_repo_id)
+    cfg.data.dataset_repo_id = "yongjincho/libero"   # <--- CHANGED
+    dataset_metadata = LeRobotDatasetMetadata(cfg.data.dataset_repo_id)
     features = dataset_to_policy_features(dataset_metadata.features)
 
     cfg.diffusion.input_features = {
@@ -69,7 +69,7 @@ def main():
 
     # We'll create normalizers later when setting up the model
     lerobot_dataset = LeRobotDataset(
-        dataset_repo_id, delta_timestamps=None)  # Using base dataset
+        cfg.data.dataset_repo_id, delta_timestamps=None)  # Using base dataset
 
     dataset = BidirectionalTrajectoryDataset(
         lerobot_dataset=lerobot_dataset,
@@ -109,9 +109,7 @@ def main():
         normalize_state_base, key_mapping)
 
     # Create the model without internal normalizers (we'll use external normalization)
-    model = HierarchicalAutoregressivePolicy(
-        config=cfg
-    )
+    model = HierarchicalAutoregressivePolicy(config=cfg)
     model.to(device)
     model.train()  # Set model to training mode
 
@@ -136,32 +134,25 @@ def main():
     print("Starting Training...")
     step = 0
     done = False
-    # best_total_loss = float('inf') # Can still track best loss if needed for saving best model
 
     while not done:
         for batch in tqdm(dataloader, desc=f"Training Step: {step}/{cfg.training.training_steps}"):
-            # Move batch to device
-            batch = wrapped_normalizer(batch)  # Normalize the batch
+            # Normalize and move to device
+            batch = wrapped_normalizer(batch)
+            batch_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                            for k, v in batch.items()}
 
-            batch_device = {}
-
-            for key, value in batch.items():
-                if isinstance(value, torch.Tensor):
-                    batch_device[key] = value.to(device)
-                else:
-                    # Handle cases where batch items might not be tensors (e.g., metadata)
-                    batch_device[key] = value
+            # <--- CHANGED: extract language instructions
+            language_instructions = batch_device['language_instruction']
 
             optimizer.zero_grad()
 
-            # Forward pass
-            # We've already normalized the batch with wrapped_normalizer above
             predictions = model(
                 initial_images=batch_device['initial_images'],
-                initial_states=batch_device['initial_states']
+                initial_states=batch_device['initial_states'],
+                language_instruction=language_instructions  # <--- CHANGED
             )
 
-            # 2. 예측값과 정답(batch_device)으로 Loss 계산
             total_loss = compute_loss(predictions, batch_device)
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

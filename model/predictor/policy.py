@@ -21,17 +21,7 @@ from typing import Dict, Any, Optional
 from model.modules.modules import SpatialSoftmax
 from model.modules.custom_transformer import RMSNorm, ReplicaTransformerEncoderLayer, ReplicaTransformerEncoder
 from model.predictor.config import PolicyConfig
-from model.modules.component_blocks import InputBlock, OutputHeadBlock
-from model.modules.visual_modules import ImageEncoder, ImageDecoder
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from dataclasses import dataclass
-from typing import Dict, Any
-
-# 필요한 다른 모듈들을 import 합니다.
-# 이 클래스들은 별도의 파일(예: visual_modules.py)에 있어도 무방합니다.
-from model.modules.visual_modules import ImageEncoder, ImageDecoder
+from model.modules.visual_modules import ImageEncoder, ImageDecoder, LanguageEncoder
 
 
 def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -74,136 +64,81 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         # unpack sub-configs
         h_cfg = config.hierarchical_transformer
         v_cfg = config.vision_encoder
+        l_cfg = config.language_encoder
         d_cfg = config.data
 
         # --- module initialization ---
-        self.image_encoder = ImageEncoder(v_cfg)
-        self.image_decoder = ImageDecoder(v_cfg)
+        self.image_encoder   = ImageEncoder(v_cfg)
+        self.language_encoder = LanguageEncoder(l_cfg)  # <--- NEW
+        self.image_decoder   = ImageDecoder(v_cfg)
         self.state_projection = nn.Linear(h_cfg.state_dim, h_cfg.hidden_dim)
-        self.goal_latent_reprojection = nn.Linear(
-            v_cfg.image_latent_dim, h_cfg.hidden_dim)
-        self.bwd_summary_projection = nn.Linear(
-            h_cfg.hidden_dim, h_cfg.hidden_dim)
+        self.lang_projection  = nn.Linear(l_cfg.projection_dim, h_cfg.hidden_dim)  # <--- NEW
 
-        # --- encoder & decoder ---
+        # new learnable query tokens
+        self.goal_query = nn.Parameter(torch.randn(1, h_cfg.num_goal_tokens, h_cfg.hidden_dim))
+        self.bwd_query  = nn.Parameter(torch.randn(1, h_cfg.num_bwd_tokens, h_cfg.hidden_dim))
+        self.fwd_query  = nn.Parameter(torch.randn(1, h_cfg.num_fwd_tokens, h_cfg.hidden_dim))
+
+        # --- multi-modal encoder ---
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=h_cfg.hidden_dim, nhead=h_cfg.num_heads, dim_feedforward=h_cfg.hidden_dim * 4,
+            d_model=h_cfg.hidden_dim, nhead=h_cfg.num_heads, dim_feedforward=h_cfg.hidden_dim*4,
             dropout=h_cfg.dropout, activation='gelu', batch_first=True, norm_first=True)
-        self.context_encoder = nn.TransformerEncoder(
+        self.multi_modal_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=h_cfg.num_layers, norm=nn.LayerNorm(h_cfg.hidden_dim))
-
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=h_cfg.hidden_dim, nhead=h_cfg.num_heads, dim_feedforward=h_cfg.hidden_dim * 4,
-            dropout=h_cfg.dropout, activation='gelu', batch_first=True, norm_first=True)
-        self.prediction_decoder = nn.TransformerDecoder(
-            decoder_layer, num_layers=h_cfg.num_layers, norm=nn.LayerNorm(h_cfg.hidden_dim))
-
-        # --- query tokens & positional embeddings ---
-        self.history_pos_embedding = nn.Embedding(
-            d_cfg.n_obs_steps * 2, h_cfg.hidden_dim)
-        self.query_embedding = nn.Embedding(
-            3, h_cfg.hidden_dim)  # 0:Goal, 1:Bwd, 2:Fwd
 
         # --- output heads ---
         self.goal_head = nn.Linear(h_cfg.hidden_dim, v_cfg.image_latent_dim)
-        self.bwd_head = nn.Linear(
-            h_cfg.hidden_dim, h_cfg.backward_steps * h_cfg.state_dim)
-        self.fwd_head = nn.Linear(
-            h_cfg.hidden_dim, h_cfg.forward_steps * h_cfg.state_dim)
-        self.progress_head = nn.Linear(h_cfg.hidden_dim, 1)
+        self.bwd_head  = nn.Linear(h_cfg.hidden_dim, h_cfg.backward_steps * h_cfg.state_dim)
+        self.fwd_head  = nn.Linear(h_cfg.hidden_dim, h_cfg.forward_steps  * h_cfg.state_dim)
 
-    def encode(self, initial_images, initial_states):
+    def encode(self, initial_images, initial_states, language_instruction):
         """과거 이력을 인코딩하여 memory를 생성합니다."""
-        device = initial_images.device
-        batch_size, n_obs, _, _, _ = initial_images.shape
-        img_embeds = self.image_encoder(
-            initial_images.flatten(0, 1)).view(batch_size, n_obs, -1)
+        # embed each modality
+        batch_size = initial_images.shape[0]
+        img_embeds   = self.image_encoder(initial_images.flatten(0,1)).view(batch_size, d_cfg.n_obs_steps, -1)
         state_embeds = self.state_projection(initial_states)
-        history_sequence = torch.cat([img_embeds, state_embeds], dim=1)
+        lang_embed   = self.language_encoder(language_instruction).unsqueeze(1)
 
-        pos_ids = torch.arange(
-            history_sequence.shape[1], device=device).unsqueeze(0)
-        history_sequence += self.history_pos_embedding(pos_ids)
+        # concat: [lang, state_hist, img_hist, goal_q, bwd_q, fwd_q]
+        seq = torch.cat([
+            lang_embed,
+            state_embeds,
+            img_embeds,
+            self.goal_query.expand(batch_size, -1, -1),
+            self.bwd_query .expand(batch_size, -1, -1),
+            self.fwd_query .expand(batch_size, -1, -1)
+        ], dim=1)
 
-        return self.context_encoder(history_sequence)
+        # build causal mask allowing cross-modal attends
+        seq_len = seq.size(1)
+        mask = torch.ones(seq_len, seq_len, device=seq.device, dtype=torch.bool)
+        mask.triu_(1)
+        # allow bwd to see goal, and fwd to see goal+bwd
+        goal_start = 1 + state_embeds.size(1) + img_embeds.size(1)
+        bwd_start  = goal_start + h_cfg.num_goal_tokens
+        fwd_start  = bwd_start + h_cfg.num_bwd_tokens
+        mask[bwd_start:, goal_start:bwd_start] = False
+        mask[fwd_start:, goal_start:fwd_start] = False
 
-    def forward(self, initial_images, initial_states, **kwargs) -> Dict[str, torch.Tensor]:
+        out = self.multi_modal_encoder(seq, mask=mask)
+        return out[:, goal_start], out[:, bwd_start], out[:, fwd_start]
+
+    def forward(self, initial_images, initial_states, language_instruction, **kwargs):
         """
         학습을 위한 forward 함수. 한 번의 pass로 모든 예측을 효율적으로 처리합니다.
         """
-        device = initial_images.device
-        batch_size = initial_images.shape[0]
-
-        memory = self.encode(initial_images, initial_states)
-
-        query_ids = torch.arange(3, device=device).unsqueeze(
-            0).expand(batch_size, -1)
-        query_embeds = self.query_embedding(query_ids)
-
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(
-            query_embeds.size(1)).to(device)
-
-        decoder_output = self.prediction_decoder(
-            tgt=query_embeds, memory=memory, tgt_mask=tgt_mask)
-
-        goal_h, bwd_h, fwd_h = decoder_output[:,
-                                              0], decoder_output[:, 1], decoder_output[:, 2]
         h_cfg = self.config.hierarchical_transformer
-
-        predictions = {
+        goal_h, bwd_h, fwd_h = self.encode(initial_images, initial_states, language_instruction)
+        preds = {
             "predicted_goal_latents": self.goal_head(goal_h),
-            "predicted_backward_states": self.bwd_head(bwd_h).view(batch_size, h_cfg.backward_steps, -1),
-            "predicted_forward_states": self.fwd_head(fwd_h).view(batch_size, h_cfg.forward_steps, -1),
-            "predicted_progress": torch.sigmoid(self.progress_head(memory.mean(dim=1)))
+            "predicted_backward_states": self.bwd_head(bwd_h).view(-1, h_cfg.backward_steps, -1),
+            "predicted_forward_states": self.fwd_head(fwd_h).view(-1, h_cfg.forward_steps, -1),
         }
-        predictions["predicted_goal_images"] = self.image_decoder(
-            predictions["predicted_goal_latents"])
-
-        return predictions
+        preds["predicted_goal_images"] = self.image_decoder(preds["predicted_goal_latents"])
+        return preds
 
     @torch.no_grad()
-    def generate(self, initial_images, initial_states) -> Dict[str, torch.Tensor]:
+    def generate(self, initial_images, initial_states, language_instruction) -> Dict[str, torch.Tensor]:
         """추론을 위한 generate 함수. Goal -> Bwd -> Fwd 순서로 순차 생성합니다."""
-        self.eval()
-        device = initial_images.device
-
-        memory = self.encode(initial_images, initial_states)
-
-        # 단계 1: Goal 예측
-        goal_query = self.query_embedding.weight[0].unsqueeze(0).unsqueeze(0)
-        goal_h = self.prediction_decoder(
-            tgt=goal_query, memory=memory).squeeze(1)
-        pred_goal_latent = self.goal_head(goal_h)
-        pred_goal_image = self.image_decoder(pred_goal_latent)
-
-        # 단계 2: Bwd 예측
-        goal_result_embed = self.goal_latent_reprojection(
-            pred_goal_latent).unsqueeze(1)
-        bwd_query = self.query_embedding.weight[1].unsqueeze(0).unsqueeze(0)
-        bwd_tgt = torch.cat([goal_result_embed, bwd_query], dim=1)
-        bwd_mask = nn.Transformer.generate_square_subsequent_mask(
-            bwd_tgt.size(1)).to(device)
-        bwd_h = self.prediction_decoder(
-            tgt=bwd_tgt, memory=memory, tgt_mask=bwd_mask)[:, -1, :]
-        pred_bwd_states = self.bwd_head(bwd_h).view(
-            1, self.config.backward_steps, -1)
-
-        # 단계 3: Fwd 예측
-        bwd_summary = self.state_projection(pred_bwd_states.mean(dim=1))
-        bwd_result_embed = self.bwd_summary_projection(
-            bwd_summary).unsqueeze(1)
-        fwd_query = self.query_embedding.weight[2].unsqueeze(0).unsqueeze(0)
-        fwd_tgt = torch.cat(
-            [goal_result_embed, bwd_result_embed, fwd_query], dim=1)
-        fwd_mask = nn.Transformer.generate_square_subsequent_mask(
-            fwd_tgt.size(1)).to(device)
-        fwd_h = self.prediction_decoder(
-            tgt=fwd_tgt, memory=memory, tgt_mask=fwd_mask)[:, -1, :]
-        pred_fwd_states = self.fwd_head(fwd_h).view(
-            1, self.config.forward_steps, -1)
-
-        return {
-            "predicted_goal_images": pred_goal_image,
-            "predicted_backward_states": pred_bwd_states,
-            "predicted_forward_states": pred_fwd_states
-        }
+        # reuse forward for generation
+        return self.forward(initial_images, initial_states, language_instruction)

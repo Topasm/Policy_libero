@@ -1,43 +1,67 @@
 import torch
 import torch.nn as nn
-import torchvision.models as models
-import torchvision.transforms as transforms
-# model/modules/modules.py 에 SpatialSoftmax가 있다고 가정
-from model.modules.modules import SpatialSoftmax
+from transformers import AutoImageProcessor, AutoModel, AutoTokenizer, CLIPTextModel
+from model.predictor.config import VisionEncoderConfig, LanguageEncoderConfig
 
-# Import configuration from dedicated config file
-from model.predictor.config import HierarchicalPolicyConfig
+
+class PerceiverResampler(nn.Module):
+    """
+    Perceiver Resampler for compressing a sequence of features.
+    """
+
+    def __init__(self, input_dim, output_dim, num_latents, num_layers, num_heads):
+        super().__init__()
+        self.latents = nn.Parameter(torch.randn(num_latents, input_dim))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers
+        )
+        self.projection = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x):
+        latents = self.latents.unsqueeze(0).expand(x.shape[0], -1, -1)
+        # Cross-attend from latents to the input sequence x
+        full_seq = torch.cat([latents, x], dim=1)
+        output = self.transformer_encoder(full_seq)
+        return self.projection(output[:, :self.latents.shape[0], :])
 
 
 class ImageEncoder(nn.Module):
-    def __init__(self, config: HierarchicalPolicyConfig):
+    def __init__(self, cfg: VisionEncoderConfig):
         super().__init__()
-        self.config = config
-        self.do_crop = True
-        self.center_crop = transforms.CenterCrop(
-            (config.image_size, config.image_size))
-        self.maybe_random_crop = transforms.RandomCrop(
-            (config.image_size, config.image_size)) if config.crop_is_random else self.center_crop
+        self.vit = AutoModel.from_pretrained(cfg.vision_backbone)
+        self.resampler = PerceiverResampler(
+            input_dim=self.vit.config.hidden_size,
+            output_dim=cfg.image_latent_dim,
+            num_latents=cfg.perceiver.num_latents,
+            num_layers=cfg.perceiver.num_layers,
+            num_heads=cfg.perceiver.num_heads,
+        )
 
-        resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+    def forward(self, images):
+        outputs = self.vit(pixel_values=images)
+        image_feats = outputs.last_hidden_state
+        resampled_feats = self.resampler(image_feats)
+        return resampled_feats.mean(dim=1)
 
-        with torch.no_grad():
-            dummy_input = torch.zeros(
-                1, config.image_channels, config.image_size, config.image_size)
-            feature_map_shape = self.backbone(dummy_input).shape[1:]
 
-        self.pool = SpatialSoftmax(feature_map_shape, num_kp=32)
-        self.out = nn.Linear(32 * 2, config.image_latent_dim)
-        self.layer_norm = nn.LayerNorm(config.image_latent_dim)
+class LanguageEncoder(nn.Module):
+    def __init__(self, cfg: LanguageEncoderConfig):
+        super().__init__()
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+        self.text_encoder = CLIPTextModel.from_pretrained(cfg.model_name)
+        self.projection = nn.Linear(cfg.embedding_dim, cfg.projection_dim)
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        images = self.maybe_random_crop(
-            images) if self.training else self.center_crop(images)
-        features = self.backbone(images)
-        keypoints = self.pool(features)
-        features_flat = torch.flatten(keypoints, start_dim=1)
-        return self.layer_norm(self.out(features_flat))
+    def forward(self, texts):
+        inputs = self.tokenizer(texts, padding=True,
+                                return_tensors="pt", truncation=True)
+        inputs = {k: v.to(self.text_encoder.device) for k, v in inputs.items()}
+        text_outputs = self.text_encoder(**inputs)
+        pooled_output = text_outputs.pooler_output
+        return self.projection(pooled_output)
 
 
 class ImageDecoder(nn.Module):
