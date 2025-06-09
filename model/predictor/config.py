@@ -94,7 +94,7 @@ class DataConfig:
 @dataclass
 class TrainingConfig:
     """Configuration for training."""
-    training_steps: int = 50000
+    training_steps: int = 20000
     batch_size: int = 32
     learning_rate: float = 1e-4
     weight_decay: float = 1e-6
@@ -105,8 +105,18 @@ class TrainingConfig:
 
 
 @dataclass
+class WandbConfig:
+    """Configuration for Weights & Biases logging."""
+    project: str = "policy-libero-project"
+    entity: Optional[str] = None  # Your wandb username or team name
+    group: str = "bidirectional-transformer"
+    mode: str = "online"
+
+
+@dataclass
 class PolicyConfig:
     """Unified configuration class for the entire project."""
+    wandb: WandbConfig = field(default_factory=WandbConfig)
     vision_encoder: VisionEncoderConfig = field(
         default_factory=VisionEncoderConfig)
     language_encoder: LanguageEncoderConfig = field(

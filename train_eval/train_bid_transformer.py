@@ -8,6 +8,7 @@ from pathlib import Path
 import safetensors.torch
 import numpy as np
 from tqdm import tqdm
+import wandb  # [MODIFIED] Import wandb
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.datasets.utils import dataset_to_policy_features, PolicyFeature
@@ -16,7 +17,7 @@ from lerobot.configs.types import FeatureType
 
 from model.predictor.policy import HierarchicalAutoregressivePolicy, compute_loss
 from model.predictor.config import PolicyConfig
-from dataset.bidirectional_dataset import BidirectionalTrajectoryDataset
+from model.predictor.bidirectional_dataset import BidirectionalTrajectoryDataset
 from model.predictor.normalization_utils import KeyMappingNormalizer
 
 
@@ -26,6 +27,16 @@ def main():
     output_directory = Path("outputs/train/bidirectional_transformer")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- [MODIFIED] Wandb Initialization ---
+    wandb.init(
+        project=cfg.wandb.project,
+        entity=cfg.wandb.entity,
+        group=cfg.wandb.group,
+        mode=cfg.wandb.mode,
+        config=cfg.to_dict()  # Log all hyperparameters
+    )
+    # ---
 
     # --- Dataset and Config Setup ---
     dataset_metadata = LeRobotDatasetMetadata(cfg.data.dataset_repo_id)
@@ -149,13 +160,43 @@ def main():
             optimizer.step()
             scheduler.step()
 
+            # --- [MODIFIED] Wandb Logging ---
             if step % cfg.training.log_freq == 0:
-                progress_bar.set_postfix({"Loss": f"{total_loss.item():.4f}"})
+                current_lr = scheduler.get_last_lr()[0]
+                loss_value = total_loss.item()
 
+                # Log metrics to wandb
+                wandb.log({
+                    "train/loss": loss_value,
+                    "train/learning_rate": current_lr,
+                    "step": step
+                })
+                progress_bar.set_postfix(
+                    {"Loss": f"{loss_value:.4f}", "LR": f"{current_lr:.6f}"})
+
+            # Log prediction/ground truth images periodically
             if step % cfg.training.save_freq == 0 and step > 0:
                 ckpt_path = output_directory / f"model_step_{step}.pth"
                 torch.save(model.state_dict(), ckpt_path)
                 tqdm.write(f"\nSaved checkpoint: {ckpt_path}")
+
+                # Get the first image from the batch for visualization
+                pred_img_6ch = predictions['predicted_goal_images'][0].cpu().clamp(
+                    0, 1)
+                true_img_6ch = batch_device['goal_images'][0].cpu()
+
+                # Split 6-channel image into two 3-channel images (front, wrist)
+                pred_front, pred_wrist = torch.chunk(pred_img_6ch, 2, dim=0)
+                true_front, true_wrist = torch.chunk(true_img_6ch, 2, dim=0)
+
+                wandb.log({
+                    "predictions/goal_image_front": wandb.Image(pred_front),
+                    "predictions/goal_image_wrist": wandb.Image(pred_wrist),
+                    "ground_truth/goal_image_front": wandb.Image(true_front),
+                    "ground_truth/goal_image_wrist": wandb.Image(true_wrist),
+                    "step": step
+                })
+            # ---
 
             step += 1
             progress_bar.update(1)
@@ -184,6 +225,8 @@ def main():
         safetensors.torch.save_file(
             stats_to_save, output_directory / "stats.safetensors")
         print(f"Stats saved to: {output_directory / 'stats.safetensors'}")
+
+    wandb.finish()  # [MODIFIED] Finish the wandb run
 
 
 if __name__ == "__main__":
