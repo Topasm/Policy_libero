@@ -7,7 +7,7 @@ from lerobot.common.policies.normalize import Normalize
 # Import the invdyn model directly
 from model.invdyn.invdyn import MlpInvDynamic
 # For state/action dims, horizon etc.
-from model.diffusion.configuration_mymodel import DiffusionConfig
+from model.predictor.config import PolicyConfig  # <--- CHANGED
 # Need MyDiffusionModel only to reuse its compute_invdyn_loss method easily
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 
@@ -25,23 +25,17 @@ def main():
     dataset_metadata = LeRobotDatasetMetadata(dataset_repo_id)
     features = dataset_to_policy_features(dataset_metadata.features)
 
-    # Use DiffusionConfig just to get parameters easily
-    # Provide dummy features to satisfy validation and property access
-    cfg = DiffusionConfig(
-        # Add dummy state feature
-        input_features={"observation.state": features["observation.state"]},
-        # Keep dummy action feature
-        output_features={"action": features["action"]}
-    )
+    # <--- CHANGED: use unified config
+    cfg = PolicyConfig()
 
     # --- Model ---
     invdyn_model = MlpInvDynamic(
-        o_dim=features["observation.state"].shape[0],  # s_{t-1}, s_t
+        o_dim=features["observation.state"].shape[0],
         a_dim=features["action"].shape[0],
-        hidden_dim=cfg.inv_dyn_hidden_dim,
-        dropout=0.1,
-        use_layernorm=True,
-        out_activation=torch.nn.Tanh(),
+        hidden_dim=cfg.inverse_dynamics.hidden_dim,      # <--- CHANGED
+        dropout=cfg.inverse_dynamics.dropout,
+        use_layernorm=cfg.inverse_dynamics.use_layernorm,
+        out_activation=cfg.inverse_dynamics.out_activation,
     )
     invdyn_model.train()
     invdyn_model.to(device)
@@ -70,7 +64,7 @@ def main():
 
     # --- Optimizer, Scheduler & Dataloader ---
     optimizer = torch.optim.Adam(
-        invdyn_model.parameters(), lr=cfg.inv_dyn_lr)  # Use same LR for now
+        invdyn_model.parameters(), lr=cfg.training.learning_rate)  # <--- CHANGED
     # Add LR scheduler with cosine annealing
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=training_steps)

@@ -20,7 +20,7 @@ from typing import Dict, Any, Optional
 
 from model.modules.modules import SpatialSoftmax
 from model.modules.custom_transformer import RMSNorm, ReplicaTransformerEncoderLayer, ReplicaTransformerEncoder
-from model.predictor.config import HierarchicalPolicyConfig
+from model.predictor.config import PolicyConfig
 from model.modules.component_blocks import InputBlock, OutputHeadBlock
 from model.modules.visual_modules import ImageEncoder, ImageDecoder
 import torch
@@ -68,45 +68,49 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
 
 
 class HierarchicalAutoregressivePolicy(nn.Module):
-    def __init__(self, config: HierarchicalPolicyConfig, **kwargs):
+    def __init__(self, config: PolicyConfig, **kwargs):
         super().__init__()
         self.config = config
+        # unpack sub-configs
+        h_cfg = config.hierarchical_transformer
+        v_cfg = config.vision_encoder
+        d_cfg = config.data
 
-        # --- 모듈 초기화 ---
-        self.image_encoder = ImageEncoder(config)
-        self.image_decoder = ImageDecoder(config)
-        self.state_projection = nn.Linear(config.state_dim, config.hidden_dim)
+        # --- module initialization ---
+        self.image_encoder = ImageEncoder(v_cfg)
+        self.image_decoder = ImageDecoder(v_cfg)
+        self.state_projection = nn.Linear(h_cfg.state_dim, h_cfg.hidden_dim)
         self.goal_latent_reprojection = nn.Linear(
-            config.image_latent_dim, config.hidden_dim)
+            v_cfg.image_latent_dim, h_cfg.hidden_dim)
         self.bwd_summary_projection = nn.Linear(
-            config.hidden_dim, config.hidden_dim)
+            h_cfg.hidden_dim, h_cfg.hidden_dim)
 
-        # --- 인코더와 디코더 ---
+        # --- encoder & decoder ---
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.hidden_dim, nhead=config.num_heads, dim_feedforward=config.hidden_dim * 4,
-            dropout=config.dropout, activation='gelu', batch_first=True, norm_first=True)
+            d_model=h_cfg.hidden_dim, nhead=h_cfg.num_heads, dim_feedforward=h_cfg.hidden_dim * 4,
+            dropout=h_cfg.dropout, activation='gelu', batch_first=True, norm_first=True)
         self.context_encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=config.num_layers, norm=nn.LayerNorm(config.hidden_dim))
+            encoder_layer, num_layers=h_cfg.num_layers, norm=nn.LayerNorm(h_cfg.hidden_dim))
 
         decoder_layer = nn.TransformerDecoderLayer(
-            d_model=config.hidden_dim, nhead=config.num_heads, dim_feedforward=config.hidden_dim * 4,
-            dropout=config.dropout, activation='gelu', batch_first=True, norm_first=True)
+            d_model=h_cfg.hidden_dim, nhead=h_cfg.num_heads, dim_feedforward=h_cfg.hidden_dim * 4,
+            dropout=h_cfg.dropout, activation='gelu', batch_first=True, norm_first=True)
         self.prediction_decoder = nn.TransformerDecoder(
-            decoder_layer, num_layers=config.num_layers, norm=nn.LayerNorm(config.hidden_dim))
+            decoder_layer, num_layers=h_cfg.num_layers, norm=nn.LayerNorm(h_cfg.hidden_dim))
 
-        # --- 쿼리 토큰 및 임베딩 ---
+        # --- query tokens & positional embeddings ---
         self.history_pos_embedding = nn.Embedding(
-            config.n_obs_steps * 2, config.hidden_dim)
+            d_cfg.n_obs_steps * 2, h_cfg.hidden_dim)
         self.query_embedding = nn.Embedding(
-            3, config.hidden_dim)  # 0:Goal, 1:Bwd, 2:Fwd
+            3, h_cfg.hidden_dim)  # 0:Goal, 1:Bwd, 2:Fwd
 
-        # --- 출력 헤드 ---
-        self.goal_head = nn.Linear(config.hidden_dim, config.image_latent_dim)
+        # --- output heads ---
+        self.goal_head = nn.Linear(h_cfg.hidden_dim, v_cfg.image_latent_dim)
         self.bwd_head = nn.Linear(
-            config.hidden_dim, config.backward_steps * config.state_dim)
+            h_cfg.hidden_dim, h_cfg.backward_steps * h_cfg.state_dim)
         self.fwd_head = nn.Linear(
-            config.hidden_dim, config.forward_steps * config.state_dim)
-        self.progress_head = nn.Linear(config.hidden_dim, 1)
+            h_cfg.hidden_dim, h_cfg.forward_steps * h_cfg.state_dim)
+        self.progress_head = nn.Linear(h_cfg.hidden_dim, 1)
 
     def encode(self, initial_images, initial_states):
         """과거 이력을 인코딩하여 memory를 생성합니다."""
@@ -144,11 +148,12 @@ class HierarchicalAutoregressivePolicy(nn.Module):
 
         goal_h, bwd_h, fwd_h = decoder_output[:,
                                               0], decoder_output[:, 1], decoder_output[:, 2]
+        h_cfg = self.config.hierarchical_transformer
 
         predictions = {
             "predicted_goal_latents": self.goal_head(goal_h),
-            "predicted_backward_states": self.bwd_head(bwd_h).view(batch_size, self.config.backward_steps, -1),
-            "predicted_forward_states": self.fwd_head(fwd_h).view(batch_size, self.config.forward_steps, -1),
+            "predicted_backward_states": self.bwd_head(bwd_h).view(batch_size, h_cfg.backward_steps, -1),
+            "predicted_forward_states": self.fwd_head(fwd_h).view(batch_size, h_cfg.forward_steps, -1),
             "predicted_progress": torch.sigmoid(self.progress_head(memory.mean(dim=1)))
         }
         predictions["predicted_goal_images"] = self.image_decoder(
