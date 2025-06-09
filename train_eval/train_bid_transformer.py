@@ -10,8 +10,9 @@ import numpy as np
 from tqdm import tqdm
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.common.datasets.utils import dataset_to_policy_features
+from lerobot.common.datasets.utils import dataset_to_policy_features, PolicyFeature
 from lerobot.common.policies.normalize import Normalize
+from lerobot.configs.types import FeatureType
 
 from model.predictor.policy import HierarchicalAutoregressivePolicy, compute_loss
 from model.predictor.config import PolicyConfig
@@ -21,33 +22,39 @@ from model.predictor.normalization_utils import KeyMappingNormalizer
 
 def main():
     """Main training function."""
-    # Instantiate unified config
     cfg = PolicyConfig()
     output_directory = Path("outputs/train/bidirectional_transformer")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Dataset and Config Setup ---
-    # Load metadata and features first to update the config
     dataset_metadata = LeRobotDatasetMetadata(cfg.data.dataset_repo_id)
     features = dataset_to_policy_features(dataset_metadata.features)
 
-    # Update config with actual dimensions from the dataset
     cfg.hierarchical_transformer.state_dim = features["observation.state"].shape[-1]
 
-    # Set feature definitions in the data config
     cfg.data.input_features = {
         "observation.state": features["observation.state"]
     }
+
+    # --- FIXED: Correct way to define output features ---
+    # Get shape from an example image key
+    example_key = cfg.data.image_keys[0]
+    # The shape from metadata is typically (C, H, W)
+    c, h, w = features[example_key].shape
+    combined_c = c * len(cfg.data.image_keys)
+
     cfg.data.output_features = {
         "predicted_forward_states": features["observation.state"],
         "predicted_backward_states": features["observation.state"],
-        "predicted_goal_images": features["observation.image"],
+        # Create a new PolicyFeature object instead of using ._replace
+        "predicted_goal_images": PolicyFeature(type=FeatureType.VISUAL, shape=(combined_c, h, w)),
     }
+    # --- END FIX ---
 
     print(f"State dimension set to: {cfg.hierarchical_transformer.state_dim}")
+    print(f"Combined image channels set to: {combined_c}")
 
-    # Use the base dataset to create our custom bidirectional dataset
     lerobot_dataset = LeRobotDataset(
         cfg.data.dataset_repo_id, delta_timestamps=None)
 
@@ -56,7 +63,7 @@ def main():
         forward_steps=cfg.hierarchical_transformer.forward_steps,
         backward_steps=cfg.hierarchical_transformer.backward_steps,
         n_obs_steps=cfg.data.n_obs_steps,
-        image_key="observation.image",
+        image_keys=cfg.data.image_keys,
         state_key="observation.state"
     )
 
@@ -71,14 +78,11 @@ def main():
     )
 
     # --- Normalization Setup ---
-    # Create a base normalizer that understands "observation.state"
     normalize_state_base = Normalize(
         {"observation.state": features["observation.state"]},
         cfg.data.normalization_mapping,
         dataset_metadata.stats
     )
-
-    # Map the keys from our batch to the keys the normalizer expects
     key_mapping = {
         "initial_states": "observation.state",
         "forward_states": "observation.state",
@@ -120,12 +124,9 @@ def main():
                 done = True
                 break
 
-            # Normalize data first, then move to device
             batch = wrapped_normalizer(batch)
             batch_device = {
                 k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-
-            # The language instruction might be a list of strings, kept on CPU
             language_instructions = batch.get('language_instruction', [])
 
             optimizer.zero_grad()
@@ -143,13 +144,12 @@ def main():
             scheduler.step()
 
             if step % cfg.training.log_freq == 0:
-                print(
-                    f"\nStep: {step}/{cfg.training.training_steps} | Loss: {total_loss.item():.4f}")
+                progress_bar.set_postfix({"Loss": f"{total_loss.item():.4f}"})
 
             if step % cfg.training.save_freq == 0 and step > 0:
                 ckpt_path = output_directory / f"model_step_{step}.pth"
                 torch.save(model.state_dict(), ckpt_path)
-                print(f"\nSaved checkpoint: {ckpt_path}")
+                tqdm.write(f"\nSaved checkpoint: {ckpt_path}")
 
             step += 1
             progress_bar.update(1)
@@ -163,8 +163,8 @@ def main():
 
     cfg.save_pretrained(output_directory)
 
-    stats_to_save = {k: torch.from_numpy(
-        v) for k, v in dataset_metadata.stats.items() if isinstance(v, np.ndarray)}
+    stats_to_save = {
+        k: v for k, v in dataset_metadata.stats.items() if isinstance(v, torch.Tensor)}
     safetensors.torch.save_file(
         stats_to_save, output_directory / "stats.safetensors")
     print(f"Stats saved to: {output_directory / 'stats.safetensors'}")

@@ -1,10 +1,5 @@
 # topasm/policy_libero/Topasm-Policy_libero-a2a8188ac53056b09728df3cc7753bfacd9df8c1/model/predictor/config.py
 #!/usr/bin/env python3
-"""
-Unified configuration for the entire policy learning framework.
-This class consolidates all parameters for different models (Hierarchical Transformer,
-Inverse Dynamics, State Diffusion) and training settings into a single source of truth.
-"""
 import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -18,7 +13,9 @@ from lerobot.configs.types import NormalizationMode, FeatureType
 class VisionEncoderConfig:
     """Configuration for the vision encoder."""
     vision_backbone: str = "google/vit-base-patch16-224"
+    image_size: int = 224  # ADDED: To specify the input size for the ViT model
     image_latent_dim: int = 512
+    image_channels: int = 6
     perceiver: Dict[str, Any] = field(default_factory=lambda: {
         "num_latents": 64,
         "num_layers": 2,
@@ -70,22 +67,21 @@ class StateDiffusionConfig:
 @dataclass
 class DataConfig:
     """Configuration for data loading and processing."""
-    dataset_repo_id: str = "lerobot/pusht"  # Default to pusht for invdyn training
+    dataset_repo_id: str = "yongjincho/libero"
+    # ADDED: Define the image keys to be loaded from the dataset
+    image_keys: List[str] = field(default_factory=lambda: [
+                                  "observation.images.front", "observation.images.wrist"])
     n_obs_steps: int = 3
     horizon: int = 16
     n_action_steps: int = 8
     diffusion_target_key: str = "observation.state"
     interpolate_state: bool = True
-
-    # Indices for fetching data, required by train_invdyn.py
     state_delta_indices: List[int] = field(
         default_factory=lambda: list(range(-1, 16)))
     action_delta_indices: List[int] = field(
         default_factory=lambda: list(range(16)))
-
     input_features: Dict[str, Any] = field(default_factory=dict)
     output_features: Dict[str, Any] = field(default_factory=dict)
-
     normalization_mapping: Dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
@@ -98,12 +94,12 @@ class DataConfig:
 @dataclass
 class TrainingConfig:
     """Configuration for training."""
-    training_steps: int = 5000
-    batch_size: int = 64
+    training_steps: int = 50000
+    batch_size: int = 32
     learning_rate: float = 1e-4
     weight_decay: float = 1e-6
-    log_freq: int = 50
-    save_freq: int = 500
+    log_freq: int = 100
+    save_freq: int = 1000
     num_workers: int = 4
     lr_scheduler_T_max_mult: int = 1
 

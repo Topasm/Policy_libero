@@ -39,6 +39,12 @@ def main():
     print("Loading dataset metadata for normalization...")
     metadata = LeRobotDatasetMetadata("lerobot/pusht")
 
+    # Define image keys - explicitly configure which cameras to use
+    image_keys = ["observation.images.front"]
+    # If the model was trained with multiple views, uncomment this:
+    # image_keys = ["observation.images.front", "observation.images.wrist"]
+    print(f"Using image keys: {image_keys}")
+
     predicted_image_dir = Path("outputs/eval/predicted_images")
     predicted_image_dir.mkdir(parents=True, exist_ok=True)
 
@@ -197,11 +203,53 @@ def main():
     print("Starting evaluation rollout with 3-stage pipeline...")
     while not done:
         state = torch.from_numpy(numpy_observation["agent_pos"])
-        image = torch.from_numpy(numpy_observation["pixels"])
+
+        # --- MODIFIED: Handle image processing based on environment structure ---
+        # Check if environment provides multiple camera views or a single view
+        if "images" in numpy_observation and isinstance(numpy_observation["images"], dict):
+            # Environment returns a dictionary with multiple camera views
+            combined_images = []
+            for key in image_keys:
+                # Extract camera name from the feature key (e.g., "observation.images.front" -> "front")
+                camera_name = key.split(".")[-1]
+                if camera_name in numpy_observation["images"]:
+                    img = numpy_observation["images"][camera_name]
+                    img_tensor = torch.from_numpy(
+                        img).to(torch.float32) / 255.0
+                    # Ensure image is in CHW format
+                    if img_tensor.dim() == 3 and img_tensor.shape[-1] in [1, 3]:
+                        img_tensor = img_tensor.permute(2, 0, 1)
+                    combined_images.append(img_tensor)
+                else:
+                    print(
+                        f"Warning: Camera '{camera_name}' not found in observation")
+
+            # Concatenate all available camera views along channel dimension
+            if combined_images:
+                image = torch.cat(combined_images, dim=0)
+            else:
+                # Fallback to using pixels if no cameras found
+                print(
+                    "Warning: No camera views found in observation, using 'pixels' instead")
+                image = torch.from_numpy(numpy_observation["pixels"]).to(
+                    torch.float32) / 255.0
+                if image.dim() == 3 and image.shape[-1] in [1, 3]:
+                    image = image.permute(2, 0, 1)
+        else:
+            # Standard environment with a single image view in "pixels"
+            image = torch.from_numpy(numpy_observation["pixels"]).to(
+                torch.float32) / 255.0
+            if image.dim() == 3 and image.shape[-1] in [1, 3]:
+                image = image.permute(2, 0, 1)
+
+            # If policy expects multiple views but env only provides one,
+            # we can duplicate the image to match expected channel count
+            if len(image_keys) > 1:
+                print(
+                    "Note: Environment only provides one image view, but policy may expect multiple")
+                # Optionally replicate image if needed: image = torch.cat([image, image], dim=0)
 
         state = state.to(torch.float32)
-        image = image.to(torch.float32) / 255
-        image = image.permute(2, 0, 1)
 
         state = state.to(device, non_blocking=True)
         image = image.to(device, non_blocking=True)
@@ -213,6 +261,8 @@ def main():
             "observation.state": state,
             "observation.image": image,
         }
+
+        print(f"Image shape passed to policy: {image.shape}")
 
         with torch.inference_mode():
             action = combined_policy.select_action(observation_for_policy)

@@ -1,0 +1,61 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+      
+      {
+        "name": "Python: Debug train_eval.eval_bid",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "train_eval.eval_bid",
+        "console": "integratedTerminal",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}"
+        }
+      }
+      ,
+      {
+        "name": "Python: Debug train_eval.train_bid_transformer",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "train_eval.train_bid_transformer",
+        "console": "integratedTerminal",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}"
+        }
+      }
+      ,
+      {
+        "name": "Python: Debug train_eval.eval_policy_ppo",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "train_eval.eval_policy_ppo",
+        "console": "integratedTerminal",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}"
+        }
+      }
+      ,
+      {
+        "name": "Python: Debug train_eval.train_diffusion",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "train_eval.train_diffusion",
+        "console": "integratedTerminal",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}"
+        }
+      }
+      ,
+      {
+        "name": "Python: Debug train_eval.train_enhanced_invdyn",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "train_eval.train_enhanced_invdyn",
+        "console": "integratedTerminal",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}"
+        }
+      }
+    ]
+  }
+  

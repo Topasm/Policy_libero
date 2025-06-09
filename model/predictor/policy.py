@@ -54,30 +54,31 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
 
     return total_loss
 
-# --- 2. 최종 정책 모델 ---
-
 
 class HierarchicalAutoregressivePolicy(nn.Module):
     def __init__(self, config: PolicyConfig, **kwargs):
         super().__init__()
         self.config = config
-        # unpack sub-configs
+        # Unpack sub-configs for easier access during initialization
         h_cfg = config.hierarchical_transformer
         v_cfg = config.vision_encoder
         l_cfg = config.language_encoder
-        d_cfg = config.data
 
         # --- module initialization ---
-        self.image_encoder   = ImageEncoder(v_cfg)
-        self.language_encoder = LanguageEncoder(l_cfg)  # <--- NEW
-        self.image_decoder   = ImageDecoder(v_cfg)
+        self.image_encoder = ImageEncoder(v_cfg)
+        self.language_encoder = LanguageEncoder(l_cfg)
+        self.image_decoder = ImageDecoder(v_cfg)
         self.state_projection = nn.Linear(h_cfg.state_dim, h_cfg.hidden_dim)
-        self.lang_projection  = nn.Linear(l_cfg.projection_dim, h_cfg.hidden_dim)  # <--- NEW
+        self.lang_projection = nn.Linear(
+            l_cfg.projection_dim, h_cfg.hidden_dim)
 
-        # new learnable query tokens
-        self.goal_query = nn.Parameter(torch.randn(1, h_cfg.num_goal_tokens, h_cfg.hidden_dim))
-        self.bwd_query  = nn.Parameter(torch.randn(1, h_cfg.num_bwd_tokens, h_cfg.hidden_dim))
-        self.fwd_query  = nn.Parameter(torch.randn(1, h_cfg.num_fwd_tokens, h_cfg.hidden_dim))
+        # New learnable query tokens
+        self.goal_query = nn.Parameter(torch.randn(
+            1, h_cfg.num_goal_tokens, h_cfg.hidden_dim))
+        self.bwd_query = nn.Parameter(torch.randn(
+            1, h_cfg.num_bwd_tokens, h_cfg.hidden_dim))
+        self.fwd_query = nn.Parameter(torch.randn(
+            1, h_cfg.num_fwd_tokens, h_cfg.hidden_dim))
 
         # --- multi-modal encoder ---
         encoder_layer = nn.TransformerEncoderLayer(
@@ -88,57 +89,82 @@ class HierarchicalAutoregressivePolicy(nn.Module):
 
         # --- output heads ---
         self.goal_head = nn.Linear(h_cfg.hidden_dim, v_cfg.image_latent_dim)
-        self.bwd_head  = nn.Linear(h_cfg.hidden_dim, h_cfg.backward_steps * h_cfg.state_dim)
-        self.fwd_head  = nn.Linear(h_cfg.hidden_dim, h_cfg.forward_steps  * h_cfg.state_dim)
+        self.bwd_head = nn.Linear(
+            h_cfg.hidden_dim, h_cfg.backward_steps * h_cfg.state_dim)
+        self.fwd_head = nn.Linear(
+            h_cfg.hidden_dim, h_cfg.forward_steps * h_cfg.state_dim)
 
     def encode(self, initial_images, initial_states, language_instruction):
-        """과거 이력을 인코딩하여 memory를 생성합니다."""
-        # embed each modality
+        """Encodes history into memory."""
         batch_size = initial_images.shape[0]
-        img_embeds   = self.image_encoder(initial_images.flatten(0,1)).view(batch_size, d_cfg.n_obs_steps, -1)
-        state_embeds = self.state_projection(initial_states)
-        lang_embed   = self.language_encoder(language_instruction).unsqueeze(1)
 
-        # concat: [lang, state_hist, img_hist, goal_q, bwd_q, fwd_q]
+        # FIXED: Access sub-configs through self.config, not local variables
+        v_cfg = self.config.vision_encoder
+        h_cfg = self.config.hierarchical_transformer
+        d_cfg = self.config.data
+
+        # Embed each modality
+        img_embeds = self.image_encoder(initial_images.flatten(0, 1)).view(
+            batch_size, d_cfg.n_obs_steps, v_cfg.image_latent_dim)
+        state_embeds = self.state_projection(initial_states)
+        lang_embed = self.language_encoder(language_instruction).unsqueeze(1)
+        lang_embed_proj = self.lang_projection(lang_embed)
+
+        # Concat: [lang, state_hist, img_hist, goal_q, bwd_q, fwd_q]
         seq = torch.cat([
-            lang_embed,
+            lang_embed_proj,
             state_embeds,
             img_embeds,
             self.goal_query.expand(batch_size, -1, -1),
-            self.bwd_query .expand(batch_size, -1, -1),
-            self.fwd_query .expand(batch_size, -1, -1)
+            self.bwd_query.expand(batch_size, -1, -1),
+            self.fwd_query.expand(batch_size, -1, -1)
         ], dim=1)
 
-        # build causal mask allowing cross-modal attends
+        # Build causal mask allowing cross-modal attends
         seq_len = seq.size(1)
-        mask = torch.ones(seq_len, seq_len, device=seq.device, dtype=torch.bool)
-        mask.triu_(1)
-        # allow bwd to see goal, and fwd to see goal+bwd
-        goal_start = 1 + state_embeds.size(1) + img_embeds.size(1)
-        bwd_start  = goal_start + h_cfg.num_goal_tokens
-        fwd_start  = bwd_start + h_cfg.num_bwd_tokens
+        mask = torch.ones(seq_len, seq_len, device=seq.device,
+                          dtype=torch.bool).triu(1)
+
+        # Allow query tokens to see history and specific other queries
+        hist_len = lang_embed_proj.size(
+            1) + state_embeds.size(1) + img_embeds.size(1)
+        goal_start = hist_len
+        bwd_start = goal_start + h_cfg.num_goal_tokens
+        fwd_start = bwd_start + h_cfg.num_bwd_tokens
+
+        mask[goal_start:, :hist_len] = False  # All queries can see all history
+        # Bwd and Fwd can see Goal
         mask[bwd_start:, goal_start:bwd_start] = False
-        mask[fwd_start:, goal_start:fwd_start] = False
+        mask[fwd_start:, bwd_start:fwd_start] = False  # Fwd can see Bwd
 
         out = self.multi_modal_encoder(seq, mask=mask)
-        return out[:, goal_start], out[:, bwd_start], out[:, fwd_start]
+
+        # Correctly slice the output based on token positions
+        goal_out = out[:, goal_start: goal_start +
+                       h_cfg.num_goal_tokens].mean(dim=1)
+        bwd_out = out[:, bwd_start: bwd_start +
+                      h_cfg.num_bwd_tokens].mean(dim=1)
+        fwd_out = out[:, fwd_start: fwd_start +
+                      h_cfg.num_fwd_tokens].mean(dim=1)
+
+        return goal_out, bwd_out, fwd_out
 
     def forward(self, initial_images, initial_states, language_instruction, **kwargs):
-        """
-        학습을 위한 forward 함수. 한 번의 pass로 모든 예측을 효율적으로 처리합니다.
-        """
+        """Efficiently processes all predictions in a single pass for training."""
         h_cfg = self.config.hierarchical_transformer
-        goal_h, bwd_h, fwd_h = self.encode(initial_images, initial_states, language_instruction)
+        goal_h, bwd_h, fwd_h = self.encode(
+            initial_images, initial_states, language_instruction)
+
         preds = {
             "predicted_goal_latents": self.goal_head(goal_h),
-            "predicted_backward_states": self.bwd_head(bwd_h).view(-1, h_cfg.backward_steps, -1),
-            "predicted_forward_states": self.fwd_head(fwd_h).view(-1, h_cfg.forward_steps, -1),
+            "predicted_backward_states": self.bwd_head(bwd_h).view(-1, h_cfg.backward_steps, h_cfg.state_dim),
+            "predicted_forward_states": self.fwd_head(fwd_h).view(-1, h_cfg.forward_steps, h_cfg.state_dim),
         }
-        preds["predicted_goal_images"] = self.image_decoder(preds["predicted_goal_latents"])
+        preds["predicted_goal_images"] = self.image_decoder(
+            preds["predicted_goal_latents"])
         return preds
 
     @torch.no_grad()
     def generate(self, initial_images, initial_states, language_instruction) -> Dict[str, torch.Tensor]:
-        """추론을 위한 generate 함수. Goal -> Bwd -> Fwd 순서로 순차 생성합니다."""
-        # reuse forward for generation
+        """Generates predictions for inference."""
         return self.forward(initial_images, initial_states, language_instruction)
