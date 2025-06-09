@@ -16,7 +16,7 @@ from lerobot.configs.types import FeatureType
 
 from model.predictor.policy import HierarchicalAutoregressivePolicy, compute_loss
 from model.predictor.config import PolicyConfig
-from model.predictor.bidirectional_dataset import BidirectionalTrajectoryDataset
+from dataset.bidirectional_dataset import BidirectionalTrajectoryDataset
 from model.predictor.normalization_utils import KeyMappingNormalizer
 
 
@@ -58,13 +58,19 @@ def main():
     lerobot_dataset = LeRobotDataset(
         cfg.data.dataset_repo_id, delta_timestamps=None)
 
+    # [MODIFIED] Get the tasks mapping from the dataset metadata.
+    tasks_mapping = dataset_metadata.tasks
+    print(f"Loaded {len(tasks_mapping)} tasks from dataset metadata.")
+
     dataset = BidirectionalTrajectoryDataset(
         lerobot_dataset=lerobot_dataset,
         forward_steps=cfg.hierarchical_transformer.forward_steps,
         backward_steps=cfg.hierarchical_transformer.backward_steps,
         n_obs_steps=cfg.data.n_obs_steps,
         image_keys=cfg.data.image_keys,
-        state_key="observation.state"
+        state_key="observation.state",
+        # [MODIFIED] Pass the tasks mapping to the dataset class.
+        tasks=tasks_mapping
     )
 
     dataloader = DataLoader(
@@ -163,11 +169,21 @@ def main():
 
     cfg.save_pretrained(output_directory)
 
-    stats_to_save = {
-        k: v for k, v in dataset_metadata.stats.items() if isinstance(v, torch.Tensor)}
-    safetensors.torch.save_file(
-        stats_to_save, output_directory / "stats.safetensors")
-    print(f"Stats saved to: {output_directory / 'stats.safetensors'}")
+    # --- FIXED: Correctly flatten the stats dictionary for safetensors ---
+    stats_to_save = {}
+    for key, value_dict in dataset_metadata.stats.items():
+        if isinstance(value_dict, dict):
+            for stat_key, stat_value in value_dict.items():
+                if isinstance(stat_value, torch.Tensor):
+                    # Create a flattened key, e.g., "action.min"
+                    flattened_key = f"{key}.{stat_key}"
+                    stats_to_save[flattened_key] = stat_value
+    # --- END FIX ---
+
+    if stats_to_save:
+        safetensors.torch.save_file(
+            stats_to_save, output_directory / "stats.safetensors")
+        print(f"Stats saved to: {output_directory / 'stats.safetensors'}")
 
 
 if __name__ == "__main__":
