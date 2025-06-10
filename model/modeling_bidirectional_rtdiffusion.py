@@ -5,10 +5,6 @@ import numpy as np
 from einops import rearrange
 
 from lerobot.common.policies.normalize import Normalize
-from lerobot.common.datasets.utils import (
-    hf_transform_to_lerobot_format,
-    lerobot_format_to_hf_transform,
-)
 
 
 class HierarchicalPolicy(nn.Module):
@@ -56,7 +52,6 @@ class HierarchicalPolicy(nn.Module):
 
         normalized_obs = self.normalize_inputs(current_raw_observation)
 
-        # Use only the first item in the batch for the queue
         obs_for_queue = {
             "observation.image": normalized_obs["observation.image"][0],
             "observation.state": normalized_obs["observation.state"][0],
@@ -101,6 +96,7 @@ class HierarchicalPolicy(nn.Module):
         for i in range(state_plan.size(1) - 1):
             s_t = state_plan[:, i, :]
             s_t_plus_1 = state_plan[:, i + 1, :]
+            # MlpInvDynamic expects two separate tensors
             action = self.inverse_dynamics_model(s_t, s_t_plus_1)
             actions.append(action)
         return torch.stack(actions, dim=1)

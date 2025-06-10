@@ -25,10 +25,10 @@
       }
       ,
       {
-        "name": "Python: Debug train_eval.eval_policy_ppo",
+        "name": "Python: Debug train_eval.evaluate_libero",
         "type": "debugpy",
         "request": "launch",
-        "module": "train_eval.eval_policy_ppo",
+        "module": "train_eval.evaluate_libero",
         "console": "integratedTerminal",
         "env": {
           "PYTHONPATH": "${workspaceFolder}"

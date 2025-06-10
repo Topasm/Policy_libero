@@ -108,7 +108,7 @@ class TrainingConfig:
 class WandbConfig:
     """Configuration for Weights & Biases logging."""
     project: str = "policy-libero-project"
-    entity: Optional[str] = None  # Your wandb username or team name
+    entity: Optional[str] = None
     group: str = "bidirectional-transformer"
     mode: str = "online"
 
@@ -131,7 +131,16 @@ class PolicyConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     def to_dict(self):
-        return asdict(self)
+        # Convert dataclasses to nested dictionaries
+        d = asdict(self)
+        # Manually handle serialization of PolicyFeature objects
+        for features_key in ["input_features", "output_features"]:
+            if features_key in d["data"]:
+                d["data"][features_key] = {
+                    k: {"type": v.type.name, "shape": v.shape}
+                    for k, v in d["data"][features_key].items()
+                }
+        return d
 
     def save_pretrained(self, output_dir: str | Path):
         output_dir = Path(output_dir)
@@ -156,17 +165,40 @@ class PolicyConfig:
         with open(config_path, "r") as f:
             config_dict = json.load(f)
 
+        # [FIXED] Manually reconstruct PolicyFeature objects from dictionaries
+        if "data" in config_dict:
+            for features_key in ["input_features", "output_features"]:
+                if features_key in config_dict["data"]:
+                    reconstructed_features = {}
+                    for key, feature_dict in config_dict["data"][features_key].items():
+                        if isinstance(feature_dict, dict) and "type" in feature_dict:
+                            # Convert string like "STATE" back to Enum FeatureType.STATE
+                            feature_type_enum = FeatureType[feature_dict["type"]]
+                            reconstructed_features[key] = PolicyFeature(
+                                type=feature_type_enum,
+                                shape=tuple(feature_dict["shape"])
+                            )
+                        else:
+                            reconstructed_features[key] = feature_dict
+                    config_dict["data"][features_key] = reconstructed_features
+        # --- END FIX ---
+
         def from_dict_to_dataclass(data_class, data):
             if "normalization_mapping" in data:
                 for k, v_str in data["normalization_mapping"].items():
                     data["normalization_mapping"][k] = NormalizationMode(v_str)
+
             field_types = {
                 f.name: f.type for f in data_class.__dataclass_fields__.values()}
+
+            # Filter out keys that are not in the dataclass definition
+            valid_keys = {f for f in field_types if f in data}
+
             return data_class(**{
-                f: from_dict_to_dataclass(field_types[f], data[f]) if hasattr(
-                    field_types[f], '__dataclass_fields__') else data.get(f)
-                for f in field_types
-                if data.get(f) is not None
+                f: from_dict_to_dataclass(field_types[f], data[f])
+                if hasattr(field_types[f], '__dataclass_fields__') and isinstance(data.get(f), dict)
+                else data.get(f)
+                for f in valid_keys
             })
 
         return from_dict_to_dataclass(cls, config_dict)

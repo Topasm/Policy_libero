@@ -130,18 +130,19 @@ def main():
 
             if step % cfg.training.log_freq == 0:
                 print(
-                    f"Step: {step}/{cfg.training.training_steps} Loss: {loss.item():.4f}")
+                    f"Step: {step}/{cfg.training.training_steps} Loss: {loss.item():.4f}", flush=True)
 
             if step % cfg.training.save_freq == 0 and step > 0:
                 ckpt_path = output_directory / f"invdyn_step_{step}.pth"
                 torch.save(invdyn_model.state_dict(), ckpt_path)
-                print(f"Saved checkpoint: {ckpt_path}")
+                print(f"Saved checkpoint: {ckpt_path}", flush=True)
 
             step += 1
 
     final_path = output_directory / "invdyn_final.pth"
     torch.save(invdyn_model.state_dict(), final_path)
-    print(f"\nTraining finished. Final model saved to: {final_path}")
+    print(
+        f"\nTraining finished. Final model saved to: {final_path}", flush=True)
 
     cfg.save_pretrained(output_directory)
 
