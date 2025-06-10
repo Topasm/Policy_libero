@@ -88,16 +88,12 @@ class HierarchicalPolicy(nn.Module):
     def _generate_actions_from_states(self, state_plan: torch.Tensor) -> torch.Tensor:
         """Generates a sequence of actions from a state plan using the inverse dynamics model."""
         actions = []
-        # state_plan has shape (B, num_steps, state_dim)
         for i in range(state_plan.size(1) - 1):
             s_t = state_plan[:, i, :]
             s_t_plus_1 = state_plan[:, i + 1, :]
 
-            # --- [FIXED] Concatenate states before passing to the model ---
-            # The MlpInvDynamic model expects a single tensor where s_t and s_{t+1} are concatenated.
-            state_pair = torch.cat([s_t, s_t_plus_1], dim=-1)
-            action = self.inverse_dynamics_model(state_pair)
-            # --- END FIX ---
+            # Call the model with two separate tensors, just like in training
+            action = self.inverse_dynamics_model(s_t, s_t_plus_1)
 
             actions.append(action)
         return torch.stack(actions, dim=1)

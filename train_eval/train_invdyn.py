@@ -13,22 +13,15 @@ from model.predictor.config import PolicyConfig
 
 def compute_loss(batch: dict[str, Tensor], model: MlpInvDynamic, cfg: PolicyConfig) -> Tensor:
     """
-    Computes the inverse dynamics loss.
-    This version is corrected to match the MlpInvDynamic model's input format.
+    Computes the inverse dynamics loss for the separated model.
     """
     all_states = batch["observation.state"]
     s_t = all_states[:, :-1]
     s_t_plus_1 = all_states[:, 1:]
     true_actions = batch["action"]
 
-    # --- [FIXED] Concatenate states before passing to the model ---
-    state_pairs = torch.cat([s_t, s_t_plus_1], dim=-1)
-    B, T, D_pair = state_pairs.shape
-    state_pairs_flat = state_pairs.reshape(B * T, D_pair)
-    pred_actions_flat = model(state_pairs_flat)
-    action_dim = true_actions.shape[-1]
-    pred_actions = pred_actions_flat.view(B, T, action_dim)
-    # --- END FIX ---
+    # The new model expects separate s_t and s_{t+1}
+    pred_actions = model(s_t, s_t_plus_1)
 
     num_actions = min(pred_actions.shape[1], true_actions.shape[1])
     pred_actions = pred_actions[:, :num_actions]
@@ -64,9 +57,11 @@ def main():
     else:
         activation_module = nn.Identity()
 
+    # [MODIFIED] Model Instantiation
+    # MlpInvDynamic is now an alias for SeparatedInvDyn, which handles the split internally.
     invdyn_model = MlpInvDynamic(
         o_dim=features["observation.state"].shape[0],
-        a_dim=features["action"].shape[0],
+        a_dim=features["action"].shape[0],  # a_dim is still 7 here
         hidden_dim=cfg.inverse_dynamics.hidden_dim,
         dropout=cfg.inverse_dynamics.dropout,
         use_layernorm=cfg.inverse_dynamics.use_layernorm,
