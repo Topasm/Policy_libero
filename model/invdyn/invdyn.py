@@ -49,36 +49,49 @@ class SeparatedInvDyn(nn.Module):
 
     def __init__(self, o_dim, a_dim, hidden_dim=512, dropout=0.1, use_layernorm=True, out_activation: nn.Module = nn.Tanh()):
         super().__init__()
+
         if a_dim != 7:
             raise ValueError(
                 f"SeparatedInvDyn expects total action dim of 7, but got {a_dim}")
 
-        arm_o_dim = o_dim
-        gripper_o_dim = 1
+        if o_dim != 8:
+            raise ValueError(
+                f"SeparatedInvDyn expects total observation dim of 8, but got {o_dim}")
 
+        # --- [FIXED] Define observation dimension for each sub-model based on 6+2 split ---
+        arm_o_dim = 6      # 팔 모델은 팔 상태(6차원)만 봅니다.
+        gripper_o_dim = 2  # 그리퍼 모델은 그리퍼 상태(2차원)만 봅니다.
+
+        # Model for the 6-DoF arm movement
         self.arm_model = _SingleMlpInvDyn(
             o_dim=arm_o_dim, a_dim=6, hidden_dim=hidden_dim, dropout=dropout,
             use_layernorm=use_layernorm, out_activation=out_activation
         )
+
+        # Model for the 1-DoF gripper action
         self.gripper_model = _SingleMlpInvDyn(
             o_dim=gripper_o_dim, a_dim=1, hidden_dim=hidden_dim // 4,
             dropout=dropout, use_layernorm=use_layernorm, out_activation=out_activation
         )
 
     def forward(self, s_t: Tensor, s_t_plus_1: Tensor) -> Tensor:
-        state_pair_arm = torch.cat([s_t, s_t_plus_1], dim=-1)
+        # --- [FIXED] Slice the input states according to the 6+2 split ---
+
+        # 1. Arm model sees the arm state transition (first 6 dims)
+        s_t_arm = s_t[..., :6]
+        s_t_plus_1_arm = s_t_plus_1[..., :6]
+        state_pair_arm = torch.cat([s_t_arm, s_t_plus_1_arm], dim=-1)
         pred_arm_action = self.arm_model(state_pair_arm)
 
-        s_t_gripper = s_t[..., -1:]
-        s_t_plus_1_gripper = s_t_plus_1[..., -1:]
+        # 2. Gripper model sees the gripper state transition (last 2 dims)
+        s_t_gripper = s_t[..., 6:]
+        s_t_plus_1_gripper = s_t_plus_1[..., 6:]
         state_pair_gripper = torch.cat(
             [s_t_gripper, s_t_plus_1_gripper], dim=-1)
         pred_gripper_action = self.gripper_model(state_pair_gripper)
 
-        # --- [MODIFIED] Apply sign() function only during evaluation ---
         if not self.training:
             pred_gripper_action = torch.sign(pred_gripper_action)
-        # --- END MODIFICATION ---
 
         return torch.cat([pred_arm_action, pred_gripper_action], dim=-1)
 

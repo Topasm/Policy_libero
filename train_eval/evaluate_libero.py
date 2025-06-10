@@ -13,12 +13,29 @@ import numpy as np
 import imageio
 import tqdm
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import draccus
-import os  # os import 추가
+import os
+import math
+from collections import deque
 
 # 토크나이저 병렬 처리 경고 비활성화
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# [MODIFIED] Add the quaternion to axis-angle conversion helper function
+
+
+def _quat2axisangle(quat):
+    if quat[3] > 1.0:
+        quat[3] = 1.0
+    elif quat[3] < -1.0:
+        quat[3] = -1.0
+
+    den = np.sqrt(1.0 - quat[3] * quat[3])
+    if math.isclose(den, 0.0):
+        return np.zeros(3)
+
+    return (quat[:3] * 2.0 * math.acos(quat[3])) / den
 
 
 # --- 1. 평가 설정을 위한 dataclass 정의 (가이드의 GenerateConfig 역할) ---
@@ -40,6 +57,10 @@ class EvalConfig:
 
     # --- 결과 저장 및 로깅 설정 ---
     output_dir: str = "outputs/eval/libero_benchmark"
+
+    # [MODIFIED] Added parameters for stabilization and replanning
+    num_steps_wait: int = 10
+    replan_steps: int = 5
 
 
 @draccus.wrap()
@@ -148,7 +169,8 @@ def main(cfg: EvalConfig):
                 env=env,
                 task_description=task_description,
                 initial_state=init_state,
-                device=device
+                device=device,
+                cfg=cfg
             )
 
             if success:
@@ -172,59 +194,80 @@ def main(cfg: EvalConfig):
         f"Total Success Rate: {total_successes}/{total_episodes} ({overall_success_rate:.1f}%)")
 
 
-def run_episode(policy, env, task_description, initial_state, device):
+def run_episode(policy, env, task_description, initial_state, device, cfg: EvalConfig):
     """ 한 에피소드를 실행하고 성공 여부와 렌더링된 프레임을 반환합니다. """
     policy.reset()
     env.set_init_state(initial_state)
 
-    # set_init_state 이후, 첫 관측값을 얻기 위해 더미 스텝을 실행합니다.
-    # 이 때의 obs는 초기 상태에 해당합니다.
+    # action_plan is now managed here
+    action_plan = deque()
+
     obs, _, _, _ = env.step(np.zeros(7))
+    frames = []
 
-    # --- 상하 반전 및 이미지 순서 변경 ---
-    concatenated_frame = np.concatenate(
-        [obs["frontview_image"], obs["robot0_eye_in_hand_image"]], axis=1)
-    frames = [np.flip(concatenated_frame, axis=0)]
-    # --- 여기까지 수정 ---
+    max_steps = env.horizon
+    t = 0
 
-    max_steps = env.env.horizon
-    terminated = False
-    info = {}  # info 딕셔너리를 미리 초기화
+    while t < max_steps:
+        # 1. Wait for simulation to stabilize
+        if t < cfg.num_steps_wait:
+            obs, _, terminated, info = env.step(np.zeros(7))
+            if t == cfg.num_steps_wait - 1:
+                # Start recording frames after waiting
+                concatenated_frame = np.concatenate(
+                    [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1)
+                frames.append(np.flip(concatenated_frame, axis=0))
+            t += 1
+            continue
 
-    # 루프 시작 전에 이미 1 스텝을 소모했으므로, max_steps - 1 만큼만 반복합니다.
-    for _ in range(max_steps - 1):
-        eef_pos = obs["robot0_eef_pos"]
-        eef_quat = obs["robot0_eef_quat"]
-        gripper_qpos = obs["robot0_gripper_qpos"][0:1]  # Gripper state
-        state_np = np.concatenate([eef_pos, eef_quat, gripper_qpos])
-        state = torch.from_numpy(state_np).to(
-            device, dtype=torch.float32).unsqueeze(0)
+        # 2. Check if we need to replan (every replan_steps)
+        if (t - cfg.num_steps_wait) % cfg.replan_steps == 0:
+            # Construct observation dict for the policy
+            state_np = np.concatenate([obs["robot0_eef_pos"], _quat2axisangle(
+                obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]])
+            state = torch.from_numpy(state_np).to(
+                device, dtype=torch.float32).unsqueeze(0)
 
-        front_img = torch.from_numpy(obs["frontview_image"]).permute(
-            2, 0, 1).to(device, dtype=torch.float32) / 255.0
-        wrist_img = torch.from_numpy(obs["robot0_eye_in_hand_image"]).permute(
-            2, 0, 1).to(device, dtype=torch.float32) / 255.0
-        image = torch.cat([front_img, wrist_img], dim=0).unsqueeze(0)
+            front_img_raw = torch.from_numpy(obs["frontview_image"]).permute(
+                2, 0, 1).to(device, dtype=torch.float32) / 255.0
+            wrist_img_raw = torch.from_numpy(obs["robot0_eye_in_hand_image"]).permute(
+                2, 0, 1).to(device, dtype=torch.float32) / 255.0
+            front_img = torch.rot90(front_img_raw, k=2, dims=(1, 2))
+            wrist_img = torch.rot90(wrist_img_raw, k=2, dims=(1, 2))
+            image = torch.stack([front_img, wrist_img], dim=0).unsqueeze(0)
 
-        observation_dict = {
-            "observation.image": image,
-            "observation.state": state,
-            "language_instruction": [task_description]
-        }
+            observation_dict = {
+                "observation.image": image,
+                "observation.state": state,
+                "language_instruction": [task_description]
+            }
 
-        action = policy.select_action(observation_dict).cpu().numpy()
+            # Generate a new chunk of actions
+            action_chunk = policy.plan_actions(observation_dict)
+            action_plan.extend(action_chunk)
+
+        # 3. Get the next action from the plan
+        if not action_plan:
+            # If plan is empty (e.g., not enough history yet), take a dummy action
+            action = np.zeros(7)
+            action[-1] = -1  # Gripper open
+        else:
+            action = action_plan.popleft().cpu().numpy()
+
+        # 4. Apply corrections and step the environment
+        action[0:6] = -action[0:6]
         obs, _, terminated, info = env.step(action)
 
-        # --- 상하 반전 및 이미지 순서 변경 ---
+        # Save frame for video
         concatenated_frame = np.concatenate(
-            [obs["frontview_image"], obs["robot0_eye_in_hand_image"]], axis=1)
+            [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1)
         frames.append(np.flip(concatenated_frame, axis=0))
-        # --- 여기까지 수정 ---
 
         if terminated:
             break
 
-    # 에피소드가 타임아웃으로 종료될 경우 'success' 키가 없을 수 있으므로 방어 코드 추가
+        t += 1
+
     if "success" not in info:
         info["success"] = False
 

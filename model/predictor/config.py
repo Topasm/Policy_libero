@@ -89,7 +89,7 @@ class DataConfig:
 @dataclass
 class TrainingConfig:
     """Configuration for training."""
-    training_steps: int = 20000
+    training_steps: int = 30000
     batch_size: int = 32
     learning_rate: float = 1e-4
     weight_decay: float = 1e-6

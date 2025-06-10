@@ -34,21 +34,19 @@ class HierarchicalPolicy(nn.Module):
             dataset_stats
         )
 
+        # This queue is now only for observation history
         self.observation_queue = deque(maxlen=self.n_obs_steps)
-        self.action_queue = deque()
-
         self.reset()
 
     def reset(self):
-        """Reset observation and action queues."""
+        """Reset observation history queue."""
         self.observation_queue.clear()
-        self.action_queue.clear()
 
     @torch.no_grad()
-    def select_action(self, current_raw_observation: dict) -> torch.Tensor:
+    def plan_actions(self, current_raw_observation: dict) -> list[torch.Tensor]:
         """
-        Selects an action using an action chunking strategy.
-        A new plan is generated only when the action queue is empty.
+        Takes the current observation, generates a plan, and returns a
+        sequence of action tensors (action chunk).
         """
         # Add a batch dimension if not present
         for key in current_raw_observation:
@@ -56,46 +54,33 @@ class HierarchicalPolicy(nn.Module):
                 current_raw_observation[key] = current_raw_observation[key].unsqueeze(
                     0)
 
-        # Normalize the new observation and add it to the history queue
         normalized_obs = self.normalize_inputs(current_raw_observation)
 
         obs_for_queue = {
-            "observation.image": normalized_obs["observation.image"][0],
-            "observation.state": normalized_obs["observation.state"][0],
+            # Remove batch dim for queue
+            "observation.image": normalized_obs["observation.image"].squeeze(0),
+            "observation.state": normalized_obs["observation.state"].squeeze(0),
         }
         self.observation_queue.append(obs_for_queue)
 
-        # Return a default zero action if there isn't enough history yet
+        # Return empty list if there isn't enough history
         if len(self.observation_queue) < self.n_obs_steps:
-            action_dim = self.output_features["action"].shape[-1]
-            return torch.zeros(action_dim, device=next(self.parameters()).device)
+            return []
 
-        # Generate a new action plan only if the action queue is empty
-        if not self.action_queue:
-            # Prepare a batch from the history queue
-            model_input_batch = {
-                "initial_images": torch.stack([obs["observation.image"] for obs in self.observation_queue]).unsqueeze(0),
-                "initial_states": torch.stack([obs["observation.state"] for obs in self.observation_queue]).unsqueeze(0),
-                "language_instruction": current_raw_observation["language_instruction"]
-            }
+        # Prepare batch for the model from history
+        model_input_batch = {
+            "initial_images": torch.stack([obs["observation.image"] for obs in self.observation_queue]).unsqueeze(0),
+            "initial_states": torch.stack([obs["observation.state"] for obs in self.observation_queue]).unsqueeze(0),
+            "language_instruction": current_raw_observation["language_instruction"]
+        }
 
-            # 1. Generate a plan of future states
-            state_plan = self._generate_state_plan(model_input_batch)
+        state_plan = self._generate_state_plan(model_input_batch)
+        actions_normalized = self._generate_actions_from_states(state_plan)
+        actions_denormalized = self.unnormalize_outputs(
+            {"action": actions_normalized})["action"]
 
-            # 2. Generate a sequence of actions from the state plan
-            actions_normalized = self._generate_actions_from_states(state_plan)
-
-            # 3. Denormalize the entire action sequence
-            actions_denormalized = self.unnormalize_outputs(
-                {"action": actions_normalized})["action"]
-
-            # 4. Add the sequence of actions to the execution queue
-            # Squeeze the batch dimension and add each action tensor to the deque
-            for i in range(actions_denormalized.shape[1]):
-                self.action_queue.append(actions_denormalized.squeeze(0)[i])
-
-        # Pop the next action from the queue and return it
-        return self.action_queue.popleft()
+        # Return a list of action tensors
+        return list(actions_denormalized.squeeze(0))
 
     def _generate_state_plan(self, model_input_batch: dict) -> torch.Tensor:
         """Generates a sequence of future states using the planner."""

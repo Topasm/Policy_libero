@@ -84,8 +84,9 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         self.language_encoder = LanguageEncoder(l_cfg)
         self.image_decoder = ImageDecoder(v_cfg)
 
-        self.arm_state_encoder = nn.Linear(7, h_cfg.hidden_dim)
-        self.gripper_state_encoder = nn.Linear(1, h_cfg.hidden_dim)
+        # --- [FIXED] Separate State Encoders for Arm (6D) and Gripper (2D) ---
+        self.arm_state_encoder = nn.Linear(6, h_cfg.hidden_dim)
+        self.gripper_state_encoder = nn.Linear(2, h_cfg.hidden_dim)
         self.state_projector = nn.Linear(
             h_cfg.hidden_dim * 2, h_cfg.hidden_dim)
 
@@ -93,20 +94,17 @@ class HierarchicalAutoregressivePolicy(nn.Module):
             l_cfg.projection_dim, h_cfg.hidden_dim)
         self.image_feature_projector = nn.Linear(
             v_cfg.image_latent_dim * 2, h_cfg.hidden_dim)
-
         self.goal_query = nn.Parameter(torch.randn(
             1, h_cfg.num_goal_tokens, h_cfg.hidden_dim))
         self.bwd_query = nn.Parameter(torch.randn(
             1, h_cfg.num_bwd_tokens, h_cfg.hidden_dim))
         self.fwd_query = nn.Parameter(torch.randn(
             1, h_cfg.num_fwd_tokens, h_cfg.hidden_dim))
-
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=h_cfg.hidden_dim, nhead=h_cfg.num_heads, dim_feedforward=h_cfg.hidden_dim*4,
             dropout=h_cfg.dropout, activation='gelu', batch_first=True, norm_first=True)
         self.multi_modal_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=h_cfg.num_layers, norm=nn.LayerNorm(h_cfg.hidden_dim))
-
         self.goal_head = nn.Linear(h_cfg.hidden_dim, v_cfg.image_latent_dim)
         self.bwd_head = nn.Linear(
             h_cfg.hidden_dim, h_cfg.backward_steps * h_cfg.state_dim)
@@ -135,8 +133,8 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         img_embeds = img_embeds_proj.view(batch_size, n_obs_steps, -1)
 
         # 2. State Processing
-        arm_states = initial_states[..., :7]
-        gripper_states = initial_states[..., 7:]
+        arm_states = initial_states[..., :6]
+        gripper_states = initial_states[..., 6:]
 
         arm_embeds = self.arm_state_encoder(arm_states)
         gripper_embeds = self.gripper_state_encoder(gripper_states)
