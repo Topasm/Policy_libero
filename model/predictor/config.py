@@ -15,12 +15,7 @@ class VisionEncoderConfig:
     vision_backbone: str = "google/vit-base-patch16-224"
     image_size: int = 224  # ADDED: To specify the input size for the ViT model
     image_latent_dim: int = 512
-    image_channels: int = 6
-    perceiver: Dict[str, Any] = field(default_factory=lambda: {
-        "num_latents": 64,
-        "num_layers": 2,
-        "num_heads": 8
-    })
+    image_channels: int = 3  # [MODIFIED] Changed back from 6 to 3
 
 
 @dataclass

@@ -66,24 +66,6 @@ class BidirectionalTrajectoryDataset(Dataset):
         # Create valid trajectory samples
         self.samples = self._create_samples()
 
-    def _get_combined_image(self, data_item: Dict) -> torch.Tensor:
-        """
-        여러 이미지 키에서 이미지를 로드하고 채널 방향으로 연결합니다.
-        Helper to load and concatenate images from multiple keys.
-        """
-        images = []
-        for key in self.image_keys:
-            if key in data_item:
-                images.append(torch.as_tensor(
-                    data_item[key], dtype=torch.float32))
-
-        # 이미지가 없는 경우 처리
-        if not images:
-            raise KeyError(
-                f"None of the image keys {self.image_keys} found in data item")
-
-        return torch.cat(images, dim=0)
-
     def _create_samples(self):
         """
         데이터셋에서 유효한 학습 샘플을 생성합니다.
@@ -216,12 +198,19 @@ class BidirectionalTrajectoryDataset(Dataset):
                     obs_idx = len(self.lerobot_dataset) - 1
 
                 obs_data = self.lerobot_dataset[obs_idx]
-                # 수정: 여러 이미지 키를 처리하는 메서드 사용
-                initial_images.append(self._get_combined_image(obs_data))
+
+                # Load images from all keys and stack them on a new dimension
+                # This creates a (num_cameras, C, H, W) tensor, e.g., (2, 3, 224, 224)
+                stacked_image = torch.stack(
+                    [torch.as_tensor(obs_data[key], dtype=torch.float32)
+                     for key in self.image_keys]
+                )
+                initial_images.append(stacked_image)
                 initial_states.append(torch.as_tensor(
                     obs_data[self.state_key], dtype=torch.float32))
 
             # 텐서로 변환
+            # Shape: (N, num_cameras, 3, H, W)
             initial_images_tensor = torch.stack(initial_images)
             initial_states_tensor = torch.stack(initial_states)
         else:
@@ -262,7 +251,10 @@ class BidirectionalTrajectoryDataset(Dataset):
         # --- Goal image loading ---
         episode_end_data_idx = sample_info['episode_true_end_idx']
         episode_end_data = self.lerobot_dataset[episode_end_data_idx]
-        goal_image_tensor = self._get_combined_image(episode_end_data)
+        goal_image_tensor = torch.stack(
+            [torch.as_tensor(episode_end_data[key], dtype=torch.float32)
+             for key in self.image_keys]
+        )  # Shape: (num_cameras, 3, H, W)
         true_episode_end_state = torch.as_tensor(
             episode_end_data[self.state_key], dtype=torch.float32)
 
