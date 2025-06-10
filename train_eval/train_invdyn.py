@@ -1,5 +1,7 @@
 import torch
-import torch.nn as nn  # Added to support activation function mapping
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
 from pathlib import Path
 import safetensors.torch
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -7,7 +9,44 @@ from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.policies.normalize import Normalize
 from model.invdyn.invdyn import MlpInvDynamic
 from model.predictor.config import PolicyConfig
-#
+
+
+def compute_loss(batch: dict[str, Tensor], model: MlpInvDynamic, cfg: PolicyConfig) -> Tensor:
+    """
+    Computes the inverse dynamics loss.
+    This version is corrected to match the MlpInvDynamic model's input format.
+    """
+    all_states = batch["observation.state"]
+    s_t = all_states[:, :-1]
+    s_t_plus_1 = all_states[:, 1:]
+    true_actions = batch["action"]
+
+    # --- [FIXED] Concatenate states before passing to the model ---
+    state_pairs = torch.cat([s_t, s_t_plus_1], dim=-1)
+    B, T, D_pair = state_pairs.shape
+    state_pairs_flat = state_pairs.reshape(B * T, D_pair)
+    pred_actions_flat = model(state_pairs_flat)
+    action_dim = true_actions.shape[-1]
+    pred_actions = pred_actions_flat.view(B, T, action_dim)
+    # --- END FIX ---
+
+    num_actions = min(pred_actions.shape[1], true_actions.shape[1])
+    pred_actions = pred_actions[:, :num_actions]
+    true_actions = true_actions[:, :num_actions]
+
+    if "action_is_pad" in batch:
+        pad_mask = batch["action_is_pad"][:, :num_actions]
+        mask = ~pad_mask
+
+        loss_per_element = F.mse_loss(
+            pred_actions, true_actions, reduction="none")
+        loss_per_element = loss_per_element * mask.unsqueeze(-1)
+        loss = loss_per_element.sum() / (mask.sum() *
+                                         pred_actions.shape[-1] + 1e-8)
+    else:
+        loss = F.mse_loss(pred_actions, true_actions)
+
+    return loss
 
 
 def main():
@@ -15,38 +54,27 @@ def main():
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- Unified Config Setup ---
     cfg = PolicyConfig()
-
-    # --- Dataset and Metadata ---
     dataset_repo_id = cfg.data.dataset_repo_id
     dataset_metadata = LeRobotDatasetMetadata(dataset_repo_id)
     features = dataset_to_policy_features(dataset_metadata.features)
 
-    # --- Activation Function Mapping ---
-    # Convert string from config to an actual nn.Module
     if cfg.inverse_dynamics.out_activation == "Tanh":
         activation_module = nn.Tanh()
     else:
         activation_module = nn.Identity()
 
-    # --- Model ---
     invdyn_model = MlpInvDynamic(
         o_dim=features["observation.state"].shape[0],
         a_dim=features["action"].shape[0],
         hidden_dim=cfg.inverse_dynamics.hidden_dim,
         dropout=cfg.inverse_dynamics.dropout,
         use_layernorm=cfg.inverse_dynamics.use_layernorm,
-        out_activation=activation_module,  # Pass the nn.Module instance
+        out_activation=activation_module,
     )
     invdyn_model.train()
     invdyn_model.to(device)
 
-    # Helper model instance to reuse loss computation logic (as in original code)
-    loss_computer = MyDiffusionModel(cfg).to(device)
-
-    # --- Normalization ---
-    # Access normalization_mapping from the correct sub-config 'data'
     normalize_state = Normalize(
         {"observation.state": features["observation.state"]
          }, cfg.data.normalization_mapping, dataset_metadata.stats
@@ -56,8 +84,6 @@ def main():
          }, cfg.data.normalization_mapping, dataset_metadata.stats
     )
 
-    # --- Dataset ---
-    # Fetch data using delta indices from the config file
     delta_timestamps = {
         "observation.state": [i / dataset_metadata.fps for i in cfg.data.state_delta_indices],
         "action": [i / dataset_metadata.fps for i in cfg.data.action_delta_indices],
@@ -65,12 +91,11 @@ def main():
     dataset = LeRobotDataset(
         dataset_repo_id, delta_timestamps=delta_timestamps)
 
-    # --- Optimizer, Scheduler & Dataloader ---
-    # Use training parameters from the config
     optimizer = torch.optim.Adam(
         invdyn_model.parameters(), lr=cfg.training.learning_rate)
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.training.training_steps)
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.training.num_workers,
@@ -80,13 +105,9 @@ def main():
         drop_last=True,
     )
 
-    # --- Training Loop ---
     step = 0
     done = False
     print("Starting Inverse Dynamics Model Training...")
-    print(
-        f"Training for {cfg.training.training_steps} steps with cosine annealing LR schedule")
-    print(f"Initial learning rate: {optimizer.param_groups[0]['lr']:.6f}")
 
     while not done:
         for batch in dataloader:
@@ -94,14 +115,13 @@ def main():
                 done = True
                 break
 
-            invdyn_loss_batch = normalize_state(batch)
-            invdyn_loss_batch = normalize_action(invdyn_loss_batch)
-            invdyn_loss_batch['action_is_pad'] = batch['action_is_pad']
-            invdyn_loss_batch = {k: v.to(
-                device) for k, v in invdyn_loss_batch.items() if isinstance(v, torch.Tensor)}
+            normalized_batch = normalize_state(batch)
+            normalized_batch = normalize_action(normalized_batch)
+            normalized_batch['action_is_pad'] = batch['action_is_pad']
+            device_batch = {k: v.to(device) for k, v in normalized_batch.items(
+            ) if isinstance(v, torch.Tensor)}
 
-            loss = loss_computer.compute_invdyn_loss(
-                invdyn_loss_batch, invdyn_model)
+            loss = compute_loss(device_batch, invdyn_model, cfg)
 
             loss.backward()
             optimizer.step()
@@ -109,9 +129,8 @@ def main():
             lr_scheduler.step()
 
             if step % cfg.training.log_freq == 0:
-                current_lr = lr_scheduler.get_last_lr()[0]
                 print(
-                    f"Step: {step}/{cfg.training.training_steps} Loss: {loss.item():.4f} LR: {current_lr:.6f}")
+                    f"Step: {step}/{cfg.training.training_steps} Loss: {loss.item():.4f}")
 
             if step % cfg.training.save_freq == 0 and step > 0:
                 ckpt_path = output_directory / f"invdyn_step_{step}.pth"
@@ -120,19 +139,23 @@ def main():
 
             step += 1
 
-    # --- Save Final Model & Stats ---
     final_path = output_directory / "invdyn_final.pth"
     torch.save(invdyn_model.state_dict(), final_path)
-    print(
-        f"\nTraining finished. Final inverse dynamics model saved to: {final_path}")
+    print(f"\nTraining finished. Final model saved to: {final_path}")
 
     cfg.save_pretrained(output_directory)
 
-    stats_to_save = {
-        k: v for k, v in dataset_metadata.stats.items() if isinstance(v, torch.Tensor)}
-    safetensors.torch.save_file(
-        stats_to_save, output_directory / "stats.safetensors")
-    print(f"Config and stats saved to: {output_directory}")
+    stats_to_save = {}
+    for key, value_dict in dataset_metadata.stats.items():
+        if isinstance(value_dict, dict):
+            for stat_key, stat_value in value_dict.items():
+                if isinstance(stat_value, torch.Tensor):
+                    stats_to_save[f"{key}.{stat_key}"] = stat_value
+
+    if stats_to_save:
+        safetensors.torch.save_file(
+            stats_to_save, output_directory / "stats.safetensors")
+        print(f"Config and stats saved to: {output_directory}")
 
 
 if __name__ == "__main__":
