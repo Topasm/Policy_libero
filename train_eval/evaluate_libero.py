@@ -135,8 +135,8 @@ def main(cfg: EvalConfig):
                 control_freq=20,
                 # 전면, 손목 카메라 활성화
                 camera_names=["frontview", "robot0_eye_in_hand"],
-                camera_heights=96,  # 경고 메시지 방지를 위해 16의 배수로 수정
-                camera_widths=96
+                camera_heights=224,  # 경고 메시지 방지를 위해 16의 배수로 수정
+                camera_widths=224
             )
             # --- 여기까지 수정 ---
             env.seed(cfg.seed + trial_idx)
@@ -181,8 +181,11 @@ def run_episode(policy, env, task_description, initial_state, device):
     # 이 때의 obs는 초기 상태에 해당합니다.
     obs, _, _, _ = env.step(np.zeros(7))
 
-    frames = [np.concatenate(
-        [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1)]
+    # --- 상하 반전 및 이미지 순서 변경 ---
+    concatenated_frame = np.concatenate(
+        [obs["frontview_image"], obs["robot0_eye_in_hand_image"]], axis=1)
+    frames = [np.flip(concatenated_frame, axis=0)]
+    # --- 여기까지 수정 ---
 
     max_steps = env.env.horizon
     terminated = False
@@ -212,8 +215,11 @@ def run_episode(policy, env, task_description, initial_state, device):
         action = policy.select_action(observation_dict).cpu().numpy()
         obs, _, terminated, info = env.step(action)
 
-        frames.append(np.concatenate(
-            [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1))
+        # --- 상하 반전 및 이미지 순서 변경 ---
+        concatenated_frame = np.concatenate(
+            [obs["frontview_image"], obs["robot0_eye_in_hand_image"]], axis=1)
+        frames.append(np.flip(concatenated_frame, axis=0))
+        # --- 여기까지 수정 ---
 
         if terminated:
             break
