@@ -1,5 +1,13 @@
 # train_eval/evaluate_libero.py
 
+from lerobot.common.datasets.utils import dataset_to_policy_features
+from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from model.modeling_bidirectional_rtdiffusion import HierarchicalPolicy
+from model.invdyn.invdyn import MlpInvDynamic
+from model.predictor.config import PolicyConfig
+from model.predictor.policy import HierarchicalAutoregressivePolicy
+from libero.libero.envs import OffScreenRenderEnv
+from libero.libero.benchmark import get_benchmark_dict
 import torch
 import numpy as np
 import imageio
@@ -7,16 +15,11 @@ import tqdm
 from pathlib import Path
 from dataclasses import dataclass
 import draccus
+import os  # os import 추가
 
-from libero.libero.benchmark import get_benchmark_dict
-from libero.libero.envs import OffScreenRenderEnv
+# 토크나이저 병렬 처리 경고 비활성화
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-from model.predictor.policy import HierarchicalAutoregressivePolicy
-from model.predictor.config import PolicyConfig
-from model.invdyn.invdyn import MlpInvDynamic
-from model.modeling_bidirectional_rtdiffusion import HierarchicalPolicy
-from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.common.datasets.utils import dataset_to_policy_features
 
 # --- 1. 평가 설정을 위한 dataclass 정의 (가이드의 GenerateConfig 역할) ---
 
@@ -91,8 +94,7 @@ def main(cfg: EvalConfig):
 
     # --- [FIXED] Move the entire policy object to the selected device ---
     combined_policy.to(device)
-    # --- 여기까지 수정 ---
-
+    combined_policy.eval()
     print("Combined policy pipeline is ready.")
 
     # --- LIBERO 벤치마크 및 환경 설정 ---
@@ -133,8 +135,8 @@ def main(cfg: EvalConfig):
                 control_freq=20,
                 # 전면, 손목 카메라 활성화
                 camera_names=["frontview", "robot0_eye_in_hand"],
-                camera_heights=84,                         # 이미지 높이
-                camera_widths=84                           # 이미지 너비
+                camera_heights=96,  # 경고 메시지 방지를 위해 16의 배수로 수정
+                camera_widths=96
             )
             # --- 여기까지 수정 ---
             env.seed(cfg.seed + trial_idx)
@@ -172,39 +174,38 @@ def main(cfg: EvalConfig):
 
 def run_episode(policy, env, task_description, initial_state, device):
     """ 한 에피소드를 실행하고 성공 여부와 렌더링된 프레임을 반환합니다. """
-
     policy.reset()
     env.set_init_state(initial_state)
+
+    # set_init_state 이후, 첫 관측값을 얻기 위해 더미 스텝을 실행합니다.
+    # 이 때의 obs는 초기 상태에 해당합니다.
     obs, _, _, _ = env.step(np.zeros(7))
+
     frames = [np.concatenate(
-        [obs["frontview_image"], obs["robot0_eye_in_hand_image"]], axis=1)]
+        [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1)]
 
+    max_steps = env.env.horizon
     terminated = False
+    info = {}  # info 딕셔너리를 미리 초기화
 
-    while not terminated:
-        # --- [FIXED] Manually construct the 8D state vector to match training data ---
-        # The model was trained on an 8D state. We construct it from the env's obs dict.
-        # The most likely 8D state is [eef_pos (3), eef_quat (4), gripper (1)].
+    # 루프 시작 전에 이미 1 스텝을 소모했으므로, max_steps - 1 만큼만 반복합니다.
+    for _ in range(max_steps - 1):
         eef_pos = obs["robot0_eef_pos"]
         eef_quat = obs["robot0_eef_quat"]
-        gripper_qpos = obs["robot0_gripper_qpos"][0:1]
-
-        # Concatenate to form the 8D state vector
+        gripper_qpos = obs["robot0_gripper_qpos"][0:1]  # Gripper state
         state_np = np.concatenate([eef_pos, eef_quat, gripper_qpos])
         state = torch.from_numpy(state_np).to(
             device, dtype=torch.float32).unsqueeze(0)
-        # --- END FIX ---
 
         front_img = torch.from_numpy(obs["frontview_image"]).permute(
             2, 0, 1).to(device, dtype=torch.float32) / 255.0
         wrist_img = torch.from_numpy(obs["robot0_eye_in_hand_image"]).permute(
             2, 0, 1).to(device, dtype=torch.float32) / 255.0
-
         image = torch.cat([front_img, wrist_img], dim=0).unsqueeze(0)
 
         observation_dict = {
             "observation.image": image,
-            "observation.state": state,  # Pass the correctly shaped 8D state
+            "observation.state": state,
             "language_instruction": [task_description]
         }
 
@@ -216,6 +217,10 @@ def run_episode(policy, env, task_description, initial_state, device):
 
         if terminated:
             break
+
+    # 에피소드가 타임아웃으로 종료될 경우 'success' 키가 없을 수 있으므로 방어 코드 추가
+    if "success" not in info:
+        info["success"] = False
 
     return info["success"], frames
 
