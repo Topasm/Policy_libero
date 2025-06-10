@@ -13,11 +13,11 @@ class _SingleMlpInvDyn(nn.Module):
         layers = [
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim) if use_layernorm else nn.Identity(),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim) if use_layernorm else nn.Identity(),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, a_dim),
             out_activation
@@ -45,47 +45,40 @@ class _SingleMlpInvDyn(nn.Module):
 class SeparatedInvDyn(nn.Module):
     """
     Inverse dynamics model that uses two separate MLPs with different inputs.
-    - Arm model sees the full state transition.
-    - Gripper model sees only the gripper state transition.
     """
 
     def __init__(self, o_dim, a_dim, hidden_dim=512, dropout=0.1, use_layernorm=True, out_activation: nn.Module = nn.Tanh()):
         super().__init__()
-
         if a_dim != 7:
             raise ValueError(
                 f"SeparatedInvDyn expects total action dim of 7, but got {a_dim}")
 
-        # [MODIFIED] Define observation dimension for each sub-model
-        arm_o_dim = o_dim      # 팔 모델은 전체 상태(8차원)를 봅니다.
-        gripper_o_dim = 1      # 그리퍼 모델은 그리퍼 상태(1차원)만 봅니다.
+        arm_o_dim = o_dim
+        gripper_o_dim = 1
 
-        # Model for the 6-DoF arm movement
         self.arm_model = _SingleMlpInvDyn(
             o_dim=arm_o_dim, a_dim=6, hidden_dim=hidden_dim, dropout=dropout,
             use_layernorm=use_layernorm, out_activation=out_activation
         )
-
-        # Model for the 1-DoF gripper action
         self.gripper_model = _SingleMlpInvDyn(
             o_dim=gripper_o_dim, a_dim=1, hidden_dim=hidden_dim // 4,
             dropout=dropout, use_layernorm=use_layernorm, out_activation=out_activation
         )
 
     def forward(self, s_t: Tensor, s_t_plus_1: Tensor) -> Tensor:
-        # Arm model sees the full state transition.
-        # This model will now handle the sequence dimension internally.
-        pred_arm_action = self.arm_model(torch.cat([s_t, s_t_plus_1], dim=-1))
+        state_pair_arm = torch.cat([s_t, s_t_plus_1], dim=-1)
+        pred_arm_action = self.arm_model(state_pair_arm)
 
-        # [FIXED] Slice the LAST dimension (features) to get the gripper state.
         s_t_gripper = s_t[..., -1:]
         s_t_plus_1_gripper = s_t_plus_1[..., -1:]
-
         state_pair_gripper = torch.cat(
             [s_t_gripper, s_t_plus_1_gripper], dim=-1)
-
-        # This model will also handle the sequence dimension internally.
         pred_gripper_action = self.gripper_model(state_pair_gripper)
+
+        # --- [MODIFIED] Apply sign() function only during evaluation ---
+        if not self.training:
+            pred_gripper_action = torch.sign(pred_gripper_action)
+        # --- END MODIFICATION ---
 
         return torch.cat([pred_arm_action, pred_gripper_action], dim=-1)
 
