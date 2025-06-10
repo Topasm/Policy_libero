@@ -124,6 +124,9 @@ def main():
             loss = compute_loss(device_batch, invdyn_model, cfg)
 
             loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                invdyn_model.parameters(), max_norm=1.0, norm_type=2.0)
             optimizer.step()
             optimizer.zero_grad()
             lr_scheduler.step()

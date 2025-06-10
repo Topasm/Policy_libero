@@ -42,6 +42,9 @@ class MlpInvDynamic(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             _norm(),
             nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            _norm(),
+            nn.GELU(),
             nn.Linear(hidden_dim, a_dim),
             out_activation,
         )
