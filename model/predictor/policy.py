@@ -24,31 +24,26 @@ from model.modules.visual_modules import ImageEncoder, ImageDecoder, LanguageEnc
 
 
 def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
-    """모델의 예측값과 정답 값을 받아 전체 Loss를 계산합니다."""
     losses = {}
     weights = {
         'forward_state_loss': 1.0, 'backward_state_loss': 1.0,
-        'goal_image_loss': 1.0, 'progress_loss': 0.5
+        'goal_image_loss': 1.0,  # This loss will now be the sum of front and wrist image losses
     }
 
-    # For goal image, resize target to match prediction if necessary
-    if 'predicted_goal_images' in predictions and 'goal_images' in targets:
-        pred_img = predictions['predicted_goal_images']
-        # Goal images from dataset are (B, 2, 3, H, W), we take the front view for loss
-        true_img = targets['goal_images'][:, 0]
+    # [MODIFIED] Calculate loss for both front and wrist goal images
+    if 'predicted_goal_image_front' in predictions and 'goal_images' in targets:
+        # Predicted images
+        pred_front = predictions['predicted_goal_image_front']
+        pred_wrist = predictions['predicted_goal_image_wrist']
 
-        # Predicted image can be 6-channel if decoder is designed that way
-        # Let's adapt to what the decoder outputs. The current decoder outputs 3 channels.
-        # We need to ensure the decoder's output channel matches one view.
-        # Let's assume the decoder output is (B, 3, H, W) for the front view
-        if pred_img.shape[1] == 6:  # If decoder outputs 6 channels
-            pred_img = pred_img[:, :3]  # Take the first 3 for front view
+        # Ground truth images from the dataset (B, 2, 3, H, W)
+        true_front = targets['goal_images'][:, 0]
+        true_wrist = targets['goal_images'][:, 1]
 
-        if pred_img.shape[2:] != true_img.shape[2:]:
-            true_img = F.interpolate(
-                true_img, size=pred_img.shape[2:], mode='bilinear', align_corners=False)
-
-        losses['goal_image_loss'] = F.mse_loss(pred_img, true_img)
+        # Calculate separate losses and add them up
+        loss_front = F.mse_loss(pred_front, true_front)
+        loss_wrist = F.mse_loss(pred_wrist, true_wrist)
+        losses['goal_image_loss'] = loss_front + loss_wrist
 
     if 'predicted_forward_states' in predictions and 'forward_states' in targets:
         losses['forward_state_loss'] = F.l1_loss(
@@ -84,7 +79,7 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         self.language_encoder = LanguageEncoder(l_cfg)
         self.image_decoder = ImageDecoder(v_cfg)
 
-        # --- [FIXED] Separate State Encoders for Arm (6D) and Gripper (2D) ---
+        # --- [MODIFIED] Separate State Encoders for Arm (6D) and Gripper (2D) ---
         self.arm_state_encoder = nn.Linear(6, h_cfg.hidden_dim)
         self.gripper_state_encoder = nn.Linear(2, h_cfg.hidden_dim)
         self.state_projector = nn.Linear(
@@ -105,7 +100,11 @@ class HierarchicalAutoregressivePolicy(nn.Module):
             dropout=h_cfg.dropout, activation='gelu', batch_first=True, norm_first=True)
         self.multi_modal_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=h_cfg.num_layers, norm=nn.LayerNorm(h_cfg.hidden_dim))
-        self.goal_head = nn.Linear(h_cfg.hidden_dim, v_cfg.image_latent_dim)
+        # [MODIFIED] Create two separate prediction heads for goal latents
+        self.goal_head_front = nn.Linear(
+            h_cfg.hidden_dim, v_cfg.image_latent_dim)
+        self.goal_head_wrist = nn.Linear(
+            h_cfg.hidden_dim, v_cfg.image_latent_dim)
         self.bwd_head = nn.Linear(
             h_cfg.hidden_dim, h_cfg.backward_steps * h_cfg.state_dim)
         self.fwd_head = nn.Linear(
@@ -181,18 +180,24 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         return goal_out, bwd_out, fwd_out
 
     def forward(self, initial_images, initial_states, language_instruction, **kwargs):
-        """Efficiently processes all predictions in a single pass for training."""
+        """Processes all predictions, now including separate goal images."""
         h_cfg = self.config.hierarchical_transformer
         goal_h, bwd_h, fwd_h = self.encode(
             initial_images, initial_states, language_instruction)
 
+        # [MODIFIED] Predict two separate latents and decode them into two images
+        pred_latent_front = self.goal_head_front(goal_h)
+        pred_latent_wrist = self.goal_head_wrist(goal_h)
+
+        pred_img_front, pred_img_wrist = self.image_decoder(
+            pred_latent_front, pred_latent_wrist)
+
         preds = {
-            "predicted_goal_latents": self.goal_head(goal_h),
             "predicted_backward_states": self.bwd_head(bwd_h).view(-1, h_cfg.backward_steps, h_cfg.state_dim),
             "predicted_forward_states": self.fwd_head(fwd_h).view(-1, h_cfg.forward_steps, h_cfg.state_dim),
+            "predicted_goal_image_front": pred_img_front,
+            "predicted_goal_image_wrist": pred_img_wrist,
         }
-        preds["predicted_goal_images"] = self.image_decoder(
-            preds["predicted_goal_latents"])
         return preds
 
     @torch.no_grad()

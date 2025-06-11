@@ -48,7 +48,7 @@ class EvalConfig:
     invdyn_checkpoint_path: str = "outputs/train/invdyn_only/invdyn_final.pth"
 
     # --- LIBERO 벤치마크 설정 ---
-    benchmark_name: str = "libero_spatial"
+    benchmark_name: str = "libero_goal"
     task_order_index: int = 0  # 사용할 태스크 순서 인덱스
 
     # --- 평가 관련 설정 ---
@@ -205,17 +205,17 @@ def run_episode(policy, env, task_description, initial_state, device, cfg: EvalC
     obs, _, _, _ = env.step(np.zeros(7))
     frames = []
 
-    max_steps = env.horizon
+    max_steps = env.env.horizon
     t = 0
 
-    while t < max_steps:
+    while t < max_steps-1:
         # 1. Wait for simulation to stabilize
         if t < cfg.num_steps_wait:
             obs, _, terminated, info = env.step(np.zeros(7))
             if t == cfg.num_steps_wait - 1:
                 # Start recording frames after waiting
                 concatenated_frame = np.concatenate(
-                    [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1)
+                    [obs["frontview_image"], obs["robot0_eye_in_hand_image"]], axis=1)
                 frames.append(np.flip(concatenated_frame, axis=0))
             t += 1
             continue
@@ -228,12 +228,11 @@ def run_episode(policy, env, task_description, initial_state, device, cfg: EvalC
             state = torch.from_numpy(state_np).to(
                 device, dtype=torch.float32).unsqueeze(0)
 
-            front_img_raw = torch.from_numpy(obs["frontview_image"]).permute(
+            front_img = torch.from_numpy(obs["frontview_image"]).permute(
                 2, 0, 1).to(device, dtype=torch.float32) / 255.0
-            wrist_img_raw = torch.from_numpy(obs["robot0_eye_in_hand_image"]).permute(
+            wrist_img = torch.from_numpy(obs["robot0_eye_in_hand_image"]).permute(
                 2, 0, 1).to(device, dtype=torch.float32) / 255.0
-            front_img = torch.rot90(front_img_raw, k=2, dims=(1, 2))
-            wrist_img = torch.rot90(wrist_img_raw, k=2, dims=(1, 2))
+
             image = torch.stack([front_img, wrist_img], dim=0).unsqueeze(0)
 
             observation_dict = {
@@ -254,8 +253,6 @@ def run_episode(policy, env, task_description, initial_state, device, cfg: EvalC
         else:
             action = action_plan.popleft().cpu().numpy()
 
-        # 4. Apply corrections and step the environment
-        action[0:6] = -action[0:6]
         obs, _, terminated, info = env.step(action)
 
         # Save frame for video

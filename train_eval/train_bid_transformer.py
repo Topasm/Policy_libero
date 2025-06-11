@@ -24,7 +24,7 @@ from model.predictor.normalization_utils import KeyMappingNormalizer
 def main():
     """Main training function."""
     cfg = PolicyConfig()
-    output_directory = Path("outputs/train/bidirectional_transformer")
+    output_directory = Path("outputs/train/bidirectional_transformer2")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -180,23 +180,23 @@ def main():
                 torch.save(model.state_dict(), ckpt_path)
                 tqdm.write(f"\nSaved checkpoint: {ckpt_path}")
 
-                # Get the first image from the batch for visualization
-                pred_img_6ch = predictions['predicted_goal_images'][0].cpu().clamp(
+                # --- [MODIFIED] Image Logging Logic for both views ---
+                pred_img_front = predictions['predicted_goal_image_front'][0].cpu().clamp(
                     0, 1)
-                true_img_6ch = batch_device['goal_images'][0].cpu()
+                pred_img_wrist = predictions['predicted_goal_image_wrist'][0].cpu().clamp(
+                    0, 1)
 
-                # Split 6-channel image into two 3-channel images (front, wrist)
-                pred_front, pred_wrist = torch.chunk(pred_img_6ch, 2, dim=0)
-                true_front, true_wrist = torch.chunk(true_img_6ch, 2, dim=0)
+                true_img_front = batch_device['goal_images'][0, 0].cpu()
+                true_img_wrist = batch_device['goal_images'][0, 1].cpu()
 
                 wandb.log({
-                    "predictions/goal_image_front": wandb.Image(pred_front),
-                    "predictions/goal_image_wrist": wandb.Image(pred_wrist),
-                    "ground_truth/goal_image_front": wandb.Image(true_front),
-                    "ground_truth/goal_image_wrist": wandb.Image(true_wrist),
+                    "predictions/goal_image_front": wandb.Image(pred_img_front),
+                    "predictions/goal_image_wrist": wandb.Image(pred_img_wrist),
+                    "ground_truth/goal_image_front": wandb.Image(true_img_front),
+                    "ground_truth/goal_image_wrist": wandb.Image(true_img_wrist),
                     "step": step
                 })
-            # ---
+                # --- END FIX ---
 
             step += 1
             progress_bar.update(1)

@@ -93,7 +93,7 @@ class TrainingConfig:
     batch_size: int = 32
     learning_rate: float = 1e-4
     weight_decay: float = 1e-6
-    log_freq: int = 100
+    log_freq: int = 1000
     save_freq: int = 1000
     num_workers: int = 4
     lr_scheduler_T_max_mult: int = 1
@@ -125,21 +125,26 @@ class PolicyConfig:
     data: DataConfig = field(default_factory=DataConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
+    # [MODIFIED] Corrected the to_dict method
     def to_dict(self):
-        # Convert dataclasses to nested dictionaries
+        """Converts the config to a JSON-serializable dictionary."""
+        # asdict converts all dataclasses to dicts, including nested ones.
         d = asdict(self)
-        # Manually handle serialization of PolicyFeature objects
+
+        # After asdict, PolicyFeature's `type` is an Enum object.
+        # We need to convert this Enum object to its string name for JSON.
         for features_key in ["input_features", "output_features"]:
-            if features_key in d["data"]:
-                d["data"][features_key] = {
-                    k: {"type": v.type.name, "shape": v.shape}
-                    for k, v in d["data"][features_key].items()
-                }
+            if features_key in d["data"] and d["data"][features_key]:
+                for key, feature_dict in d["data"][features_key].items():
+                    # Check if the value is a dict and has a 'type' key whose value is an Enum
+                    if isinstance(feature_dict, dict) and "type" in feature_dict and hasattr(feature_dict["type"], 'name'):
+                        feature_dict["type"] = feature_dict["type"].name
         return d
 
     def save_pretrained(self, output_dir: str | Path):
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        output_directory = Path(output_dir)
+        output_directory.mkdir(parents=True, exist_ok=True)
+        # to_dict() is now corrected
         config_dict = self.to_dict()
 
         def enum_to_str(d):
@@ -150,9 +155,9 @@ class PolicyConfig:
                     d[k] = v.value
             return d
 
-        with open(output_dir / "config.json", "w") as f:
+        with open(output_directory / "config.json", "w") as f:
             json.dump(enum_to_str(config_dict), f, indent=2, sort_keys=True)
-        print(f"Configuration saved to {output_dir / 'config.json'}")
+        print(f"Configuration saved to {output_directory / 'config.json'}")
 
     @classmethod
     def from_pretrained(cls, output_dir: str | Path):
@@ -160,14 +165,12 @@ class PolicyConfig:
         with open(config_path, "r") as f:
             config_dict = json.load(f)
 
-        # [FIXED] Manually reconstruct PolicyFeature objects from dictionaries
         if "data" in config_dict:
             for features_key in ["input_features", "output_features"]:
                 if features_key in config_dict["data"]:
                     reconstructed_features = {}
                     for key, feature_dict in config_dict["data"][features_key].items():
                         if isinstance(feature_dict, dict) and "type" in feature_dict:
-                            # Convert string like "STATE" back to Enum FeatureType.STATE
                             feature_type_enum = FeatureType[feature_dict["type"]]
                             reconstructed_features[key] = PolicyFeature(
                                 type=feature_type_enum,
@@ -176,7 +179,6 @@ class PolicyConfig:
                         else:
                             reconstructed_features[key] = feature_dict
                     config_dict["data"][features_key] = reconstructed_features
-        # --- END FIX ---
 
         def from_dict_to_dataclass(data_class, data):
             if "normalization_mapping" in data:
@@ -185,8 +187,6 @@ class PolicyConfig:
 
             field_types = {
                 f.name: f.type for f in data_class.__dataclass_fields__.values()}
-
-            # Filter out keys that are not in the dataclass definition
             valid_keys = {f for f in field_types if f in data}
 
             return data_class(**{

@@ -143,30 +143,33 @@ class ImageDecoder(nn.Module):
     def __init__(self, config: VisionEncoderConfig):
         super().__init__()
         self.config = config
-
-        # --- FIXED: Modified architecture to output 256x256 images ---
-        # Start from a 4x4 spatial dimension instead of 3x3
         self.initial_linear = nn.Sequential(
             nn.Linear(config.image_latent_dim, 512 * 4 * 4), nn.ReLU())
 
         self.decoder = nn.Sequential(
-            # Input: (B, 512, 4, 4)
-            nn.ConvTranspose2d(512, 512, kernel_size=4, stride=2, padding=1), nn.BatchNorm2d(
-                512), nn.ReLU(True),       # -> (B, 512, 8, 8)
-            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1), nn.BatchNorm2d(
-                256), nn.ReLU(True),       # -> (B, 256, 16, 16)
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1), nn.BatchNorm2d(
-                128), nn.ReLU(True),       # -> (B, 128, 32, 32)
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1), nn.BatchNorm2d(
-                64), nn.ReLU(True),        # -> (B, 64, 64, 64)
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1), nn.BatchNorm2d(
-                32), nn.ReLU(True),         # -> (B, 32, 128, 128)
-            nn.ConvTranspose2d(32, config.image_channels, kernel_size=4, stride=2,
-                               padding=1), nn.Sigmoid()            # -> (B, C, 256, 256)
+            nn.ConvTranspose2d(512, 512, kernel_size=4, stride=2,
+                               padding=1), nn.BatchNorm2d(512), nn.ReLU(True),
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2,
+                               padding=1), nn.BatchNorm2d(256), nn.ReLU(True),
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2,
+                               padding=1), nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2,
+                               padding=1), nn.BatchNorm2d(64), nn.ReLU(True),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2,
+                               padding=1), nn.BatchNorm2d(32), nn.ReLU(True),
+            nn.ConvTranspose2d(32, config.image_channels,
+                               kernel_size=4, stride=2, padding=1), nn.Sigmoid()
         )
-        # --- END FIX ---
 
-    def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        # Reshape to the new starting size of 4x4
-        x = self.initial_linear(latents).view(-1, 512, 4, 4)
-        return self.decoder(x)
+    # [MODIFIED] The forward method now accepts two latents and returns two images.
+    def forward(self, latent_front: torch.Tensor, latent_wrist: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """ Decodes two latent vectors into two separate images by reusing the same decoder weights. """
+        # Decode front image
+        x_front = self.initial_linear(latent_front).view(-1, 512, 4, 4)
+        pred_front = self.decoder(x_front)
+
+        # Decode wrist image
+        x_wrist = self.initial_linear(latent_wrist).view(-1, 512, 4, 4)
+        pred_wrist = self.decoder(x_wrist)
+
+        return pred_front, pred_wrist
