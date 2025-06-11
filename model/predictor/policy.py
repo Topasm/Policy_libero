@@ -16,9 +16,8 @@ The new prediction order (goal → backward → forward) enables soft conditioni
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any, Optional
+from typing import Dict
 
-from model.modules.custom_transformer import RMSNorm, ReplicaTransformerEncoderLayer, ReplicaTransformerEncoder
 from model.predictor.config import PolicyConfig
 from model.modules.visual_modules import ImageEncoder, ImageDecoder, LanguageEncoder
 
@@ -27,23 +26,20 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
     losses = {}
     weights = {
         'forward_state_loss': 1.0, 'backward_state_loss': 1.0,
-        'goal_image_loss': 1.0,  # This loss will now be the sum of front and wrist image losses
+        'goal_image_loss': 1.0,
     }
 
-    # [MODIFIED] Calculate loss for both front and wrist goal images
-    if 'predicted_goal_image_front' in predictions and 'goal_images' in targets:
-        # Predicted images
-        pred_front = predictions['predicted_goal_image_front']
-        pred_wrist = predictions['predicted_goal_image_wrist']
+    # [MODIFIED] Calculate loss only for the single predicted goal image vs. the front ground truth image.
+    if 'predicted_goal_images' in predictions and 'goal_images' in targets:
+        pred_img = predictions['predicted_goal_images']
+        # Ground truth `goal_images` has shape (B, 2, 3, H, W). We take the front view (index 0).
+        true_img_front = targets['goal_images'][:, 0]
 
-        # Ground truth images from the dataset (B, 2, 3, H, W)
-        true_front = targets['goal_images'][:, 0]
-        true_wrist = targets['goal_images'][:, 1]
+        if pred_img.shape[2:] != true_img_front.shape[2:]:
+            true_img_front = F.interpolate(
+                true_img_front, size=pred_img.shape[2:], mode='bilinear', align_corners=False)
 
-        # Calculate separate losses and add them up
-        loss_front = F.mse_loss(pred_front, true_front)
-        loss_wrist = F.mse_loss(pred_wrist, true_wrist)
-        losses['goal_image_loss'] = loss_front + loss_wrist
+        losses['goal_image_loss'] = F.mse_loss(pred_img, true_img_front)
 
     if 'predicted_forward_states' in predictions and 'forward_states' in targets:
         losses['forward_state_loss'] = F.l1_loss(
@@ -75,132 +71,124 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         v_cfg = config.vision_encoder
         l_cfg = config.language_encoder
 
+        # --- 입력 인코더 부분 (Seer 스타일의 개선된 버전 유지) ---
         self.image_encoder = ImageEncoder(v_cfg)
         self.language_encoder = LanguageEncoder(l_cfg)
         self.image_decoder = ImageDecoder(v_cfg)
-
-        # --- [MODIFIED] Separate State Encoders for Arm (6D) and Gripper (2D) ---
         self.arm_state_encoder = nn.Linear(6, h_cfg.hidden_dim)
         self.gripper_state_encoder = nn.Linear(2, h_cfg.hidden_dim)
         self.state_projector = nn.Linear(
             h_cfg.hidden_dim * 2, h_cfg.hidden_dim)
-
         self.lang_projection = nn.Linear(
             l_cfg.projection_dim, h_cfg.hidden_dim)
-        self.image_feature_projector = nn.Linear(
-            v_cfg.image_latent_dim * 2, h_cfg.hidden_dim)
-        self.goal_query = nn.Parameter(torch.randn(
-            1, h_cfg.num_goal_tokens, h_cfg.hidden_dim))
-        self.bwd_query = nn.Parameter(torch.randn(
-            1, h_cfg.num_bwd_tokens, h_cfg.hidden_dim))
-        self.fwd_query = nn.Parameter(torch.randn(
-            1, h_cfg.num_fwd_tokens, h_cfg.hidden_dim))
+        if v_cfg.image_latent_dim != h_cfg.hidden_dim:
+            self.image_token_projector = nn.Linear(
+                v_cfg.image_latent_dim, h_cfg.hidden_dim)
+        else:
+            self.image_token_projector = nn.Identity()
+
+        # --- [MODIFIED] Transformer Backbone: Reverted to Encoder-Decoder structure ---
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=h_cfg.hidden_dim, nhead=h_cfg.num_heads, dim_feedforward=h_cfg.hidden_dim*4,
             dropout=h_cfg.dropout, activation='gelu', batch_first=True, norm_first=True)
-        self.multi_modal_encoder = nn.TransformerEncoder(
+        self.context_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=h_cfg.num_layers, norm=nn.LayerNorm(h_cfg.hidden_dim))
-        # [MODIFIED] Create two separate prediction heads for goal latents
-        self.goal_head_front = nn.Linear(
-            h_cfg.hidden_dim, v_cfg.image_latent_dim)
-        self.goal_head_wrist = nn.Linear(
-            h_cfg.hidden_dim, v_cfg.image_latent_dim)
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=h_cfg.hidden_dim, nhead=h_cfg.num_heads, dim_feedforward=h_cfg.hidden_dim*4,
+            dropout=h_cfg.dropout, activation='gelu', batch_first=True, norm_first=True)
+        self.prediction_decoder = nn.TransformerDecoder(
+            decoder_layer, num_layers=h_cfg.num_layers, norm=nn.LayerNorm(h_cfg.hidden_dim))
+
+        # --- 쿼리 토큰 및 위치 임베딩 (인코더-디코더 구조용) ---
+        self.query_embedding = nn.Embedding(
+            3, h_cfg.hidden_dim)  # 0:Goal, 1:Bwd, 2:Fwd
+        # 입력 이력의 최대 길이를 계산하여 위치 임베딩 생성
+        num_lang_tokens = 1
+        num_state_tokens = config.data.n_obs_steps
+        num_image_tokens = config.data.n_obs_steps * \
+            config.vision_encoder.num_latents_per_image * \
+            len(config.data.image_keys)
+        max_history_len = num_lang_tokens + num_state_tokens + \
+            num_image_tokens + 16  # Add buffer
+        self.history_pos_embedding = nn.Parameter(
+            torch.randn(1, max_history_len, h_cfg.hidden_dim))
+
+        # --- 예측 헤드 ---
+        self.goal_head = nn.Linear(h_cfg.hidden_dim, v_cfg.image_latent_dim)
         self.bwd_head = nn.Linear(
             h_cfg.hidden_dim, h_cfg.backward_steps * h_cfg.state_dim)
         self.fwd_head = nn.Linear(
             h_cfg.hidden_dim, h_cfg.forward_steps * h_cfg.state_dim)
 
     def encode(self, initial_images, initial_states, language_instruction):
-        """Encodes history into memory."""
+        """과거 이력을 인코딩하여 memory 텐서를 생성합니다."""
         batch_size = initial_images.shape[0]
         n_obs_steps = initial_images.shape[1]
 
-        # --- [FIXED] Unpack configs at the beginning of the method for local access ---
-        v_cfg = self.config.vision_encoder
-        h_cfg = self.config.hierarchical_transformer
-
-        # 1. Image Processing
+        # 1. 각 입력을 임베딩
         images_flat = initial_images.flatten(0, 1)
-        front_images = images_flat[:, 0]
-        wrist_images = images_flat[:, 1]
+        front_images, wrist_images = images_flat[:, 0], images_flat[:, 1]
+        front_tokens, wrist_tokens = self.image_encoder(
+            front_images), self.image_encoder(wrist_images)
+        front_tokens, wrist_tokens = self.image_token_projector(
+            front_tokens), self.image_token_projector(wrist_tokens)
+        image_tokens = torch.cat([front_tokens, wrist_tokens], dim=1)
+        img_embeds = image_tokens.view(
+            batch_size, n_obs_steps * image_tokens.shape[1], -1)
 
-        front_embeds = self.image_encoder(front_images)
-        wrist_embeds = self.image_encoder(wrist_images)
+        arm_states, gripper_states = initial_states[...,
+                                                    :6], initial_states[..., 6:]
+        arm_embeds, gripper_embeds = self.arm_state_encoder(
+            arm_states), self.gripper_state_encoder(gripper_states)
+        state_embeds = self.state_projector(
+            torch.cat([arm_embeds, gripper_embeds], dim=-1))
 
-        combined_image_feats = torch.cat([front_embeds, wrist_embeds], dim=-1)
-        img_embeds_proj = self.image_feature_projector(combined_image_feats)
-        img_embeds = img_embeds_proj.view(batch_size, n_obs_steps, -1)
-
-        # 2. State Processing
-        arm_states = initial_states[..., :6]
-        gripper_states = initial_states[..., 6:]
-
-        arm_embeds = self.arm_state_encoder(arm_states)
-        gripper_embeds = self.gripper_state_encoder(gripper_states)
-        combined_state_feats = torch.cat([arm_embeds, gripper_embeds], dim=-1)
-        state_embeds = self.state_projector(combined_state_feats)
-
-        # 3. Language Processing
         lang_embed = self.language_encoder(language_instruction).unsqueeze(1)
         lang_embed_proj = self.lang_projection(lang_embed)
 
-        # Concat tokens
-        seq = torch.cat([
-            lang_embed_proj, state_embeds, img_embeds,
-            self.goal_query.expand(batch_size, -1, -1),
-            self.bwd_query.expand(batch_size, -1, -1),
-            self.fwd_query.expand(batch_size, -1, -1)
-        ], dim=1)
+        # 2. 이력 시퀀스 결합 및 위치 임베딩 추가
+        history_sequence = torch.cat(
+            [lang_embed_proj, state_embeds, img_embeds], dim=1)
+        seq_len = history_sequence.shape[1]
+        history_sequence = history_sequence + \
+            self.history_pos_embedding[:, :seq_len, :]
 
-        # Build attention mask
-        seq_len = seq.size(1)
-        mask = torch.ones(seq_len, seq_len, device=seq.device,
-                          dtype=torch.bool).triu(1)
-
-        hist_len = lang_embed_proj.size(
-            1) + state_embeds.size(1) + img_embeds.size(1)
-        goal_start = hist_len
-        bwd_start = goal_start + h_cfg.num_goal_tokens
-        fwd_start = bwd_start + h_cfg.num_bwd_tokens
-
-        mask[goal_start:, :hist_len] = False
-        mask[bwd_start:, goal_start:bwd_start] = False
-        mask[fwd_start:, bwd_start:fwd_start] = False
-
-        out = self.multi_modal_encoder(seq, mask=mask)
-
-        # Slice outputs
-        goal_out = out[:, goal_start: goal_start +
-                       h_cfg.num_goal_tokens].mean(dim=1)
-        bwd_out = out[:, bwd_start: bwd_start +
-                      h_cfg.num_bwd_tokens].mean(dim=1)
-        fwd_out = out[:, fwd_start: fwd_start +
-                      h_cfg.num_fwd_tokens].mean(dim=1)
-
-        return goal_out, bwd_out, fwd_out
+        # 3. TransformerEncoder를 통과시켜 memory 생성
+        return self.context_encoder(history_sequence)
 
     def forward(self, initial_images, initial_states, language_instruction, **kwargs):
-        """Processes all predictions, now including separate goal images."""
-        h_cfg = self.config.hierarchical_transformer
-        goal_h, bwd_h, fwd_h = self.encode(
+        """학습을 위한 forward 함수. 인코더-디코더 구조."""
+        device = initial_images.device
+        batch_size = initial_images.shape[0]
+
+        memory = self.encode(
             initial_images, initial_states, language_instruction)
 
-        # [MODIFIED] Predict two separate latents and decode them into two images
-        pred_latent_front = self.goal_head_front(goal_h)
-        pred_latent_wrist = self.goal_head_wrist(goal_h)
+        query_ids = torch.arange(3, device=device).unsqueeze(
+            0).expand(batch_size, -1)
+        query_embeds = self.query_embedding(query_ids)
 
-        pred_img_front, pred_img_wrist = self.image_decoder(
-            pred_latent_front, pred_latent_wrist)
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(
+            query_embeds.size(1), device=device)
 
+        decoder_output = self.prediction_decoder(
+            tgt=query_embeds, memory=memory, tgt_mask=tgt_mask)
+
+        goal_h, bwd_h, fwd_h = decoder_output[:,
+                                              0], decoder_output[:, 1], decoder_output[:, 2]
+
+        pred_latent = self.goal_head(goal_h)
+        pred_img = self.image_decoder(pred_latent)
+
+        h_cfg = self.config.hierarchical_transformer
         preds = {
             "predicted_backward_states": self.bwd_head(bwd_h).view(-1, h_cfg.backward_steps, h_cfg.state_dim),
             "predicted_forward_states": self.fwd_head(fwd_h).view(-1, h_cfg.forward_steps, h_cfg.state_dim),
-            "predicted_goal_image_front": pred_img_front,
-            "predicted_goal_image_wrist": pred_img_wrist,
+            "predicted_goal_images": pred_img,
         }
         return preds
 
     @torch.no_grad()
     def generate(self, initial_images, initial_states, language_instruction) -> Dict[str, torch.Tensor]:
-        """Generates predictions for inference."""
         return self.forward(initial_images, initial_states, language_instruction)

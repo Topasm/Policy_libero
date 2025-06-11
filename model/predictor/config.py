@@ -13,9 +13,11 @@ from lerobot.configs.types import NormalizationMode, FeatureType
 class VisionEncoderConfig:
     """Configuration for the vision encoder."""
     vision_backbone: str = "google/vit-base-patch16-224"
-    image_size: int = 224  # ADDED: To specify the input size for the ViT model
+    image_size: int = 224
     image_latent_dim: int = 512
-    image_channels: int = 3  # [MODIFIED] Changed back from 6 to 3
+    image_channels: int = 3
+    # [ADD] Number of latent tokens produced by the Perceiver Resampler
+    num_latents_per_image: int = 64
 
 
 @dataclass
@@ -28,11 +30,11 @@ class LanguageEncoderConfig:
 
 @dataclass
 class HierarchicalTransformerConfig:
-    """Configuration for the Hierarchical Autoregressive Transformer policy."""
-    state_dim: int = 7
-    hidden_dim: int = 512
-    num_layers: int = 6
-    num_heads: int = 8
+    """[MODIFIED] Configuration for the Hierarchical Autoregressive Transformer policy, inspired by Seer."""
+    state_dim: int = 8  # Dynamically set from data
+    hidden_dim: int = 384
+    num_layers: int = 8
+    num_heads: int = 8    # Seer uses 12
     dropout: float = 0.1
     forward_steps: int = 32
     backward_steps: int = 32
@@ -61,14 +63,13 @@ class StateDiffusionConfig:
 
 @dataclass
 class DataConfig:
-    """Configuration for data loading and processing."""
+    """[MODIFIED] Configuration for data loading and processing, inspired by Seer."""
     dataset_repo_id: str = "yongjincho/libero"
-    # ADDED: Define the image keys to be loaded from the dataset
     image_keys: List[str] = field(default_factory=lambda: [
                                   "observation.images.front", "observation.images.wrist"])
-    n_obs_steps: int = 3
+    n_obs_steps: int = 5       # Seer uses a history length of 7 for LIBERO
     horizon: int = 16
-    n_action_steps: int = 8
+    n_action_steps: int = 3
     diffusion_target_key: str = "observation.state"
     interpolate_state: bool = True
     state_delta_indices: List[int] = field(
@@ -88,12 +89,13 @@ class DataConfig:
 
 @dataclass
 class TrainingConfig:
-    """Configuration for training."""
-    training_steps: int = 30000
-    batch_size: int = 32
+    """[MODIFIED] Configuration for training, inspired by Seer."""
+    training_steps: int = 500  # A more realistic number of steps
+    batch_size: int = 16      # Seer uses a large batch size for finetuning
+    # Seer uses 1e-3 for FT, but 1e-4 is a safer starting point for pre-training
     learning_rate: float = 1e-4
     weight_decay: float = 1e-6
-    log_freq: int = 1000
+    log_freq: int = 100
     save_freq: int = 1000
     num_workers: int = 4
     lr_scheduler_T_max_mult: int = 1

@@ -84,43 +84,32 @@ class ImageEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.vit = AutoModel.from_pretrained(cfg.vision_backbone)
-
-        # [MODIFIED] The ViT now takes 3-channel images, so no need to adapt the first layer.
-        # We only need to ensure its config is correct for resizing if needed.
         self.vit.config.image_size = cfg.image_size
 
-        # [MODIFIED] Use the new, more sophisticated PerceiverResampler
+        # [MODIFIED] Use the num_latents value from the config
         self.resampler = PerceiverResampler(
             dim=self.vit.config.hidden_size,
-            # These parameters can be tuned in the future
             depth=2,
-            num_latents=64,
+            num_latents=cfg.num_latents_per_image,  # 설정값 사용
             heads=8,
             dim_head=64,
         )
-
-        # A projection layer to get the final embedding size
         self.projection = nn.Linear(
             self.vit.config.hidden_size, cfg.image_latent_dim)
 
-    def forward(self, image_tensor_3ch):  # Expects (B, 3, H, W)
-        # [FIXED] Resize input images to the size expected by the ViT model.
+    def forward(self, image_tensor_3ch):
         resized_images = TF.resize(
             image_tensor_3ch, [self.cfg.image_size, self.cfg.image_size], antialias=True)
 
         outputs = self.vit(pixel_values=resized_images)
+        image_feats = outputs.last_hidden_state[:, 1:, :]  # Ignore CLS token
 
-        # ViT output shape: (B, num_patches+1, hidden_size). We ignore the CLS token.
-        image_feats = outputs.last_hidden_state[:, 1:, :]
-
-        # Resample visual tokens into a fixed number of latents
-        # (B, num_latents, hidden_size)
         resampled_feats = self.resampler(image_feats)
-
-        # Project the latents to the desired dimension and take the mean
-        # (B, num_latents, image_latent_dim)
         projected_feats = self.projection(resampled_feats)
-        return projected_feats.mean(dim=1)  # (B, image_latent_dim)
+
+        # [MODIFIED] Return the whole sequence of latent vectors, instead of the mean.
+        # Shape: (B, num_latents, image_latent_dim) e.g. (B, 64, 512)
+        return projected_feats
 
 
 class LanguageEncoder(nn.Module):
@@ -161,15 +150,8 @@ class ImageDecoder(nn.Module):
                                kernel_size=4, stride=2, padding=1), nn.Sigmoid()
         )
 
-    # [MODIFIED] The forward method now accepts two latents and returns two images.
-    def forward(self, latent_front: torch.Tensor, latent_wrist: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """ Decodes two latent vectors into two separate images by reusing the same decoder weights. """
-        # Decode front image
-        x_front = self.initial_linear(latent_front).view(-1, 512, 4, 4)
-        pred_front = self.decoder(x_front)
-
-        # Decode wrist image
-        x_wrist = self.initial_linear(latent_wrist).view(-1, 512, 4, 4)
-        pred_wrist = self.decoder(x_wrist)
-
-        return pred_front, pred_wrist
+    # [MODIFIED] Reverted to single-latent-input, single-image-output structure.
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        """ Decodes a single latent vector into a single image. """
+        x = self.initial_linear(latents).view(-1, 512, 4, 4)
+        return self.decoder(x)
