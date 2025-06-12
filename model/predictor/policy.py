@@ -73,21 +73,18 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         l_cfg = config.language_encoder
         d_cfg = config.data
 
-        # --- 1. 모듈 초기화 ---
+        # --- 입력 인코더 ---
         self.image_encoder = ImageEncoder(v_cfg)
         self.language_encoder = LanguageEncoder(l_cfg)
         self.image_decoder = ImageDecoder(v_cfg)
 
-        # --- [FIX] 사전 학습된 백본 모델 가중치 고정 (Freezing) ---
         for param in self.image_encoder.vit.parameters():
             param.requires_grad = False
-        print("Froze ImageEncoder (ViT) backbone.")
+            print("Froze ImageEncoder (ViT) backbone.")
 
-        # --- 나머지 모듈 초기화 ---
-        self.arm_state_encoder = nn.Linear(6, h_cfg.hidden_dim)
-        self.gripper_state_encoder = nn.Linear(2, h_cfg.hidden_dim)
-        self.state_projector = nn.Linear(
-            h_cfg.hidden_dim * 2, h_cfg.hidden_dim)
+        # [MODIFIED] Reverted to a single, unified state encoder
+        self.state_projection = nn.Linear(h_cfg.state_dim, h_cfg.hidden_dim)
+
         self.lang_projection = nn.Linear(
             l_cfg.projection_dim, h_cfg.hidden_dim)
         if v_cfg.image_latent_dim != h_cfg.hidden_dim:
@@ -148,12 +145,8 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         img_embeds = image_tokens.view(
             batch_size, n_obs_steps * image_tokens.shape[1], -1)
 
-        arm_states, gripper_states = initial_states[...,
-                                                    :6], initial_states[..., 6:]
-        arm_embeds, gripper_embeds = self.arm_state_encoder(
-            arm_states), self.gripper_state_encoder(gripper_states)
-        state_embeds = self.state_projector(
-            torch.cat([arm_embeds, gripper_embeds], dim=-1))
+        # [MODIFIED] State Processing using a single projection
+        state_embeds = self.state_projection(initial_states)
 
         lang_embed = self.language_encoder(language_instruction).unsqueeze(1)
         lang_embed_proj = self.lang_projection(lang_embed)
