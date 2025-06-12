@@ -12,11 +12,11 @@ from lerobot.configs.types import NormalizationMode, FeatureType
 @dataclass
 class VisionEncoderConfig:
     """Configuration for the vision encoder."""
-    vision_backbone: str = "google/vit-base-patch16-224"
+    # [MODIFIED] Changed the backbone to the MAE-pretrained model
+    vision_backbone: str = "facebook/vit-mae-base"
     image_size: int = 224
     image_latent_dim: int = 512
     image_channels: int = 3
-    # [ADD] Number of latent tokens produced by the Perceiver Resampler
     num_latents_per_image: int = 64
 
 
