@@ -78,11 +78,7 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         self.language_encoder = LanguageEncoder(l_cfg)
         self.image_decoder = ImageDecoder(v_cfg)
 
-        for param in self.image_encoder.vit.parameters():
-            param.requires_grad = False
-        print("Froze ImageEncoder (ViT) backbone.")
-
-        # [MODIFIED] Reverted to a single, unified state encoder
+        # 상태 인코더를 하나로 통일
         self.state_projection = nn.Linear(h_cfg.state_dim, h_cfg.hidden_dim)
 
         self.lang_projection = nn.Linear(
@@ -134,7 +130,6 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         n_obs_steps = initial_images.shape[1]
         h_cfg = self.config.hierarchical_transformer
 
-        # --- 1. 입력 임베딩 ---
         images_flat = initial_images.flatten(0, 1)
         front_images, wrist_images = images_flat[:, 0], images_flat[:, 1]
         front_tokens, wrist_tokens = self.image_encoder(
@@ -145,13 +140,11 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         img_embeds = image_tokens.view(
             batch_size, n_obs_steps * image_tokens.shape[1], -1)
 
-        # [MODIFIED] State Processing using a single projection
         state_embeds = self.state_projection(initial_states)
 
         lang_embed = self.language_encoder(language_instruction).unsqueeze(1)
         lang_embed_proj = self.lang_projection(lang_embed)
 
-        # --- 2. 전체 시퀀스 조립 및 위치 임베딩 추가 ---
         seq = torch.cat([
             lang_embed_proj, state_embeds, img_embeds,
             self.goal_query.expand(batch_size, -1, -1),
@@ -160,7 +153,6 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         ], dim=1)
         seq = seq + self.pos_embed[:, :seq.shape[1], :]
 
-        # --- 3. 커스텀 어텐션 마스크 생성 ---
         seq_len = seq.shape[1]
         custom_mask_bool = torch.ones(
             seq_len, seq_len, device=seq.device, dtype=torch.bool).triu(1)
@@ -175,10 +167,8 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         custom_mask_bool[bwd_start:, goal_start:bwd_start] = False
         custom_mask_bool[fwd_start:, bwd_start:fwd_start] = False
 
-        # --- 4. CustomDecoder 백본 실행 ---
         out = self.multi_modal_backbone(seq, mask=custom_mask_bool)
 
-        # --- 5. 결과 슬라이싱 및 최종 예측 ---
         goal_h = out[:, goal_start: goal_start +
                      h_cfg.num_goal_tokens].mean(dim=1)
         bwd_h = out[:, bwd_start: bwd_start + h_cfg.num_bwd_tokens].mean(dim=1)

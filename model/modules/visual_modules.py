@@ -100,6 +100,10 @@ class ImageEncoder(nn.Module):
         self.projection = nn.Linear(
             self.vit.config.hidden_size, cfg.image_latent_dim)
 
+        for param in self.vit.parameters():
+            param.requires_grad = False
+        print("Froze ImageEncoder (ViT) backbone.")
+
     def forward(self, image_tensor_3ch):
         resized_images = TF.resize(
             image_tensor_3ch, [self.cfg.image_size, self.cfg.image_size], antialias=True)

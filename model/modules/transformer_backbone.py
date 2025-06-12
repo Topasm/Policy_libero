@@ -70,7 +70,7 @@ class CustomDecoderLayer(nn.Module):
 
 
 class CustomDecoder(nn.Module):
-    """ A stack of N custom decoder layers with U-Net like skip connections. """
+    """ A stack of N custom decoder layers. """
 
     def __init__(self, decoder_layer: nn.Module, num_layers: int, norm: Optional[nn.Module] = None):
         super().__init__()
@@ -78,29 +78,10 @@ class CustomDecoder(nn.Module):
         self.num_layers = num_layers
         self.norm = norm
 
-        # Add learnable weights for the skip connections
-        if self.num_layers % 2 != 0:
-            raise ValueError(
-                "U-Net skip connections require an even number of layers.")
-        self.skip_weights = nn.Parameter(torch.ones(num_layers // 2))
-
     def forward(self, src: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         output = src
-        skip_connections = []
-        num_skips = self.num_layers // 2
-
-        # U-Net Style Forward Pass
-        for i in range(self.num_layers):
-            if i >= num_skips:
-                skip_connection = skip_connections.pop()
-                weight_index = self.num_layers - 1 - i
-                output = output + \
-                    self.skip_weights[weight_index] * skip_connection
-
-            output = self.layers[i](output, src_mask=mask)
-
-            if i < num_skips:
-                skip_connections.append(output)
+        for mod in self.layers:
+            output = mod(output, src_mask=mask)
 
         if self.norm is not None:
             output = self.norm(output)
