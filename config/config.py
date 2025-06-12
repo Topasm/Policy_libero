@@ -22,10 +22,15 @@ class VisionEncoderConfig:
 
 @dataclass
 class LanguageEncoderConfig:
-    """Configuration for the language encoder (e.g., CLIP)."""
-    model_name: str = "openai/clip-vit-base-patch32"
-    embedding_dim: int = 512
-    projection_dim: int = 512
+    """[MODIFIED] Configuration for the open_clip language encoder."""
+    # The base architecture name known to the open_clip library
+    model_name: str = "OpenVision-ViT-Small"
+    # The Hugging Face Hub repository ID where the weights are stored
+    pretrained: str = "hf-hub:UCSC-VLAA/openvision-vit-small-patch16-224"
+    # ViT-Small has an embedding dimension of 384
+    embedding_dim: int = 384
+    # Project to the main transformer's hidden dimension (which is also 384)
+    projection_dim: int = 384
 
 
 @dataclass

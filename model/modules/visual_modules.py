@@ -1,11 +1,14 @@
 # topasm/policy_libero/Topasm-Policy_libero-a2a8188ac53056b09728df3cc7753bfacd9df8c1/model/modules/visual_modules.py
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoTokenizer, CLIPTextModel
-from einops import rearrange, repeat
-# [MODIFIED] Import for resizing
 import torchvision.transforms.functional as TF
+from einops import rearrange, repeat
+
+# [MODIFIED] Import from open_clip instead of transformers
+from open_clip import create_model_from_pretrained, get_tokenizer
+
 from config.config import VisionEncoderConfig, LanguageEncoderConfig
+from transformers import AutoModel
 
 
 def exists(val):
@@ -112,20 +115,44 @@ class ImageEncoder(nn.Module):
         return projected_feats
 
 
+# --- [MODIFIED] Rewritten LanguageEncoder using open_clip ---
 class LanguageEncoder(nn.Module):
     def __init__(self, cfg: LanguageEncoderConfig):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
-        self.text_encoder = CLIPTextModel.from_pretrained(cfg.model_name)
-        self.projection = nn.Linear(cfg.embedding_dim, cfg.projection_dim)
+        # [MODIFIED] Use both model_name and pretrained path to load the model
+        try:
+            self.model, _ = create_model_from_pretrained(
+                model_name=cfg.pretrained
+            )
+        except Exception as e:
+            print(
+                f"Error loading model with specified name '{cfg.model_name}'. Check available models in open_clip.")
+            raise e
+
+        self.tokenizer = get_tokenizer(cfg.pretrained)
+
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        if cfg.embedding_dim != cfg.projection_dim:
+            self.projection = nn.Linear(cfg.embedding_dim, cfg.projection_dim)
+            self._proj_device = lambda: self.projection.weight.device
+            self._proj_dtype = lambda: self.projection.weight.dtype
+        else:
+            self.projection = nn.Identity()
+            # [FIX] Use model's device/dtype if projection is Identity
+            self._proj_device = lambda: next(self.model.parameters()).device
+            self._proj_dtype = lambda: next(self.model.parameters()).dtype
 
     def forward(self, texts):
-        inputs = self.tokenizer(texts, padding=True,
-                                return_tensors="pt", truncation=True)
-        inputs = {k: v.to(self.text_encoder.device) for k, v in inputs.items()}
-        text_outputs = self.text_encoder(**inputs)
-        pooled_output = text_outputs.pooler_output
-        return self.projection(pooled_output)
+        device = self._proj_device()
+        dtype = self._proj_dtype()
+        self.model.to(device)
+
+        text_tokens = self.tokenizer(texts).to(device)
+        text_features = self.model.encode_text(text_tokens)
+        text_features = text_features.to(dtype)
+        return self.projection(text_features)
 
 
 class ImageDecoder(nn.Module):

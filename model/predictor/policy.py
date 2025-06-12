@@ -72,41 +72,46 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         v_cfg = config.vision_encoder
         l_cfg = config.language_encoder
         d_cfg = config.data
-        
+
         # --- 1. 모듈 초기화 ---
         self.image_encoder = ImageEncoder(v_cfg)
         self.language_encoder = LanguageEncoder(l_cfg)
         self.image_decoder = ImageDecoder(v_cfg)
-        
+
         # --- [FIX] 사전 학습된 백본 모델 가중치 고정 (Freezing) ---
         for param in self.image_encoder.vit.parameters():
             param.requires_grad = False
         print("Froze ImageEncoder (ViT) backbone.")
 
-        for param in self.language_encoder.text_encoder.parameters():
-            param.requires_grad = False
-        print("Froze LanguageEncoder (CLIP) backbone.")
-        # --- END FIX ---
-
         # --- 나머지 모듈 초기화 ---
         self.arm_state_encoder = nn.Linear(6, h_cfg.hidden_dim)
         self.gripper_state_encoder = nn.Linear(2, h_cfg.hidden_dim)
-        self.state_projector = nn.Linear(h_cfg.hidden_dim * 2, h_cfg.hidden_dim)
-        self.lang_projection = nn.Linear(l_cfg.projection_dim, h_cfg.hidden_dim)
+        self.state_projector = nn.Linear(
+            h_cfg.hidden_dim * 2, h_cfg.hidden_dim)
+        self.lang_projection = nn.Linear(
+            l_cfg.projection_dim, h_cfg.hidden_dim)
         if v_cfg.image_latent_dim != h_cfg.hidden_dim:
-            self.image_token_projector = nn.Linear(v_cfg.image_latent_dim, h_cfg.hidden_dim)
+            self.image_token_projector = nn.Linear(
+                v_cfg.image_latent_dim, h_cfg.hidden_dim)
         else:
             self.image_token_projector = nn.Identity()
 
-        self.goal_query = nn.Parameter(torch.randn(1, h_cfg.num_goal_tokens, h_cfg.hidden_dim))
-        self.bwd_query = nn.Parameter(torch.randn(1, h_cfg.num_bwd_tokens, h_cfg.hidden_dim))
-        self.fwd_query = nn.Parameter(torch.randn(1, h_cfg.num_fwd_tokens, h_cfg.hidden_dim))
+        self.goal_query = nn.Parameter(torch.randn(
+            1, h_cfg.num_goal_tokens, h_cfg.hidden_dim))
+        self.bwd_query = nn.Parameter(torch.randn(
+            1, h_cfg.num_bwd_tokens, h_cfg.hidden_dim))
+        self.fwd_query = nn.Parameter(torch.randn(
+            1, h_cfg.num_fwd_tokens, h_cfg.hidden_dim))
         num_lang_tokens = 1
         num_state_tokens = d_cfg.n_obs_steps
-        num_image_tokens = d_cfg.n_obs_steps * v_cfg.num_latents_per_image * len(d_cfg.image_keys)
-        num_query_tokens = h_cfg.num_goal_tokens + h_cfg.num_bwd_tokens + h_cfg.num_fwd_tokens
-        max_len = num_lang_tokens + num_state_tokens + num_image_tokens + num_query_tokens + 16
-        self.pos_embed = nn.Parameter(torch.randn(1, max_len, h_cfg.hidden_dim))
+        num_image_tokens = d_cfg.n_obs_steps * \
+            v_cfg.num_latents_per_image * len(d_cfg.image_keys)
+        num_query_tokens = h_cfg.num_goal_tokens + \
+            h_cfg.num_bwd_tokens + h_cfg.num_fwd_tokens
+        max_len = num_lang_tokens + num_state_tokens + \
+            num_image_tokens + num_query_tokens + 16
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, max_len, h_cfg.hidden_dim))
 
         decoder_layer = CustomDecoderLayer(
             d_model=h_cfg.hidden_dim, nhead=h_cfg.num_heads,
@@ -114,12 +119,15 @@ class HierarchicalAutoregressivePolicy(nn.Module):
             activation=F.gelu, batch_first=True
         )
         self.multi_modal_backbone = CustomDecoder(
-            decoder_layer, num_layers=h_cfg.num_layers, norm=nn.LayerNorm(h_cfg.hidden_dim)
+            decoder_layer, num_layers=h_cfg.num_layers, norm=nn.LayerNorm(
+                h_cfg.hidden_dim)
         )
 
         self.goal_head = nn.Linear(h_cfg.hidden_dim, v_cfg.image_latent_dim)
-        self.bwd_head = nn.Linear(h_cfg.hidden_dim, h_cfg.backward_steps * h_cfg.state_dim)
-        self.fwd_head = nn.Linear(h_cfg.hidden_dim, h_cfg.forward_steps * h_cfg.state_dim)
+        self.bwd_head = nn.Linear(
+            h_cfg.hidden_dim, h_cfg.backward_steps * h_cfg.state_dim)
+        self.fwd_head = nn.Linear(
+            h_cfg.hidden_dim, h_cfg.forward_steps * h_cfg.state_dim)
 
     def forward(self, initial_images, initial_states, language_instruction, **kwargs):
         """
@@ -132,14 +140,20 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         # --- 1. 입력 임베딩 ---
         images_flat = initial_images.flatten(0, 1)
         front_images, wrist_images = images_flat[:, 0], images_flat[:, 1]
-        front_tokens, wrist_tokens = self.image_encoder(front_images), self.image_encoder(wrist_images)
-        front_tokens, wrist_tokens = self.image_token_projector(front_tokens), self.image_token_projector(wrist_tokens)
+        front_tokens, wrist_tokens = self.image_encoder(
+            front_images), self.image_encoder(wrist_images)
+        front_tokens, wrist_tokens = self.image_token_projector(
+            front_tokens), self.image_token_projector(wrist_tokens)
         image_tokens = torch.cat([front_tokens, wrist_tokens], dim=1)
-        img_embeds = image_tokens.view(batch_size, n_obs_steps * image_tokens.shape[1], -1)
+        img_embeds = image_tokens.view(
+            batch_size, n_obs_steps * image_tokens.shape[1], -1)
 
-        arm_states, gripper_states = initial_states[..., :6], initial_states[..., 6:]
-        arm_embeds, gripper_embeds = self.arm_state_encoder(arm_states), self.gripper_state_encoder(gripper_states)
-        state_embeds = self.state_projector(torch.cat([arm_embeds, gripper_embeds], dim=-1))
+        arm_states, gripper_states = initial_states[...,
+                                                    :6], initial_states[..., 6:]
+        arm_embeds, gripper_embeds = self.arm_state_encoder(
+            arm_states), self.gripper_state_encoder(gripper_states)
+        state_embeds = self.state_projector(
+            torch.cat([arm_embeds, gripper_embeds], dim=-1))
 
         lang_embed = self.language_encoder(language_instruction).unsqueeze(1)
         lang_embed_proj = self.lang_projection(lang_embed)
@@ -155,9 +169,11 @@ class HierarchicalAutoregressivePolicy(nn.Module):
 
         # --- 3. 커스텀 어텐션 마스크 생성 ---
         seq_len = seq.shape[1]
-        custom_mask_bool = torch.ones(seq_len, seq_len, device=seq.device, dtype=torch.bool).triu(1)
+        custom_mask_bool = torch.ones(
+            seq_len, seq_len, device=seq.device, dtype=torch.bool).triu(1)
 
-        hist_len = lang_embed_proj.size(1) + state_embeds.size(1) + img_embeds.size(1)
+        hist_len = lang_embed_proj.size(
+            1) + state_embeds.size(1) + img_embeds.size(1)
         goal_start = hist_len
         bwd_start = goal_start + h_cfg.num_goal_tokens
         fwd_start = bwd_start + h_cfg.num_bwd_tokens
@@ -170,9 +186,10 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         out = self.multi_modal_backbone(seq, mask=custom_mask_bool)
 
         # --- 5. 결과 슬라이싱 및 최종 예측 ---
-        goal_h = out[:, goal_start : goal_start + h_cfg.num_goal_tokens].mean(dim=1)
-        bwd_h = out[:, bwd_start : bwd_start + h_cfg.num_bwd_tokens].mean(dim=1)
-        fwd_h = out[:, fwd_start : fwd_start + h_cfg.num_fwd_tokens].mean(dim=1)
+        goal_h = out[:, goal_start: goal_start +
+                     h_cfg.num_goal_tokens].mean(dim=1)
+        bwd_h = out[:, bwd_start: bwd_start + h_cfg.num_bwd_tokens].mean(dim=1)
+        fwd_h = out[:, fwd_start: fwd_start + h_cfg.num_fwd_tokens].mean(dim=1)
 
         pred_latent = self.goal_head(goal_h)
         pred_img = self.image_decoder(pred_latent)
