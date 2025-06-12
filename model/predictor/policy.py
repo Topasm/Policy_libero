@@ -23,11 +23,11 @@ from model.modules.visual_modules import ImageEncoder, ImageDecoder, LanguageEnc
 from model.modules.transformer_backbone import CustomDecoder, CustomDecoderLayer
 
 
-def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
+def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     losses = {}
     weights = {
         'forward_state_loss': 1.0, 'backward_state_loss': 1.0,
-        'goal_image_loss': 1.0,
+        'goal_image_loss': 1.0, 'progress_loss': 1.0
     }
 
     # [MODIFIED] Calculate loss only for the single predicted goal image vs. the front ground truth image.
@@ -51,17 +51,23 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
             predictions['predicted_backward_states'], targets['backward_states'])
 
     if 'predicted_progress' in predictions and 'normalized_timestep' in targets:
+        # [FIX] Squeeze last dim to get shape [B]
         predicted = predictions['predicted_progress'].squeeze(-1)
         target = targets['normalized_timestep']
         losses['progress_loss'] = F.mse_loss(predicted, target)
 
     total_loss = torch.tensor(0.0, device=next(
         iter(predictions.values())).device)
+
+    # Calculate weighted sum of losses
     for name, loss in losses.items():
         if name in weights and loss is not None:
             total_loss += loss * weights.get(name, 1.0)
 
-    return total_loss
+    # Add the total loss to the dictionary
+    losses['total_loss'] = total_loss
+
+    return losses
 
 
 class HierarchicalAutoregressivePolicy(nn.Module):
@@ -96,18 +102,22 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         else:
             self.image_token_projector = nn.Identity()
 
+        # [MODIFIED] Add a new query token for progress prediction
+        self.progress_query = nn.Parameter(torch.randn(1, 1, h_cfg.hidden_dim))
         self.goal_query = nn.Parameter(torch.randn(
             1, h_cfg.num_goal_tokens, h_cfg.hidden_dim))
         self.bwd_query = nn.Parameter(torch.randn(
             1, h_cfg.num_bwd_tokens, h_cfg.hidden_dim))
         self.fwd_query = nn.Parameter(torch.randn(
             1, h_cfg.num_fwd_tokens, h_cfg.hidden_dim))
+
+        # [MODIFIED] Update max sequence length calculation for the new query
         num_lang_tokens = 1
         num_state_tokens = d_cfg.n_obs_steps
         num_image_tokens = d_cfg.n_obs_steps * \
             v_cfg.num_latents_per_image * len(d_cfg.image_keys)
-        num_query_tokens = h_cfg.num_goal_tokens + \
-            h_cfg.num_bwd_tokens + h_cfg.num_fwd_tokens
+        num_query_tokens = 1 + h_cfg.num_goal_tokens + \
+            h_cfg.num_bwd_tokens + h_cfg.num_fwd_tokens  # Now 4 queries
         max_len = num_lang_tokens + num_state_tokens + \
             num_image_tokens + num_query_tokens + 16
         self.pos_embed = nn.Parameter(
@@ -128,6 +138,7 @@ class HierarchicalAutoregressivePolicy(nn.Module):
             h_cfg.hidden_dim, h_cfg.backward_steps * h_cfg.state_dim)
         self.fwd_head = nn.Linear(
             h_cfg.hidden_dim, h_cfg.forward_steps * h_cfg.state_dim)
+        self.progress_head = nn.Linear(h_cfg.hidden_dim, 1)  # Progress head
 
     def forward(self, initial_images, initial_states, language_instruction, **kwargs):
         """
@@ -161,9 +172,11 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         # --- 2. 전체 시퀀스 조립 및 위치 임베딩 추가 ---
         seq = torch.cat([
             lang_embed_proj, state_embeds, img_embeds,
+            self.progress_query.expand(batch_size, -1, -1),
             self.goal_query.expand(batch_size, -1, -1),
             self.bwd_query.expand(batch_size, -1, -1),
-            self.fwd_query.expand(batch_size, -1, -1)
+            self.fwd_query.expand(batch_size, -1, -1),
+
         ], dim=1)
         seq = seq + self.pos_embed[:, :seq.shape[1], :]
 
@@ -177,9 +190,16 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         goal_start = hist_len
         bwd_start = goal_start + h_cfg.num_goal_tokens
         fwd_start = bwd_start + h_cfg.num_bwd_tokens
+        prog_start = fwd_start + h_cfg.num_fwd_tokens
 
-        custom_mask_bool[goal_start:, :hist_len] = False
+        # [MODIFIED] Update mask logic for the new hierarchy
+        # All queries see history
+        custom_mask_bool[prog_start:, :hist_len] = False
+        # Goal, Bwd, Fwd see Progress
+        custom_mask_bool[goal_start:, prog_start:goal_start] = False
+        # Bwd, Fwd see Goal
         custom_mask_bool[bwd_start:, goal_start:bwd_start] = False
+        # Fwd sees Bwd
         custom_mask_bool[fwd_start:, bwd_start:fwd_start] = False
 
         # --- 4. CustomDecoder 백본 실행 ---
@@ -190,6 +210,8 @@ class HierarchicalAutoregressivePolicy(nn.Module):
                      h_cfg.num_goal_tokens].mean(dim=1)
         bwd_h = out[:, bwd_start: bwd_start + h_cfg.num_bwd_tokens].mean(dim=1)
         fwd_h = out[:, fwd_start: fwd_start + h_cfg.num_fwd_tokens].mean(dim=1)
+        prog_h = out[:, prog_start: prog_start +
+                     1].mean(dim=1)  # Progress head
 
         pred_latent = self.goal_head(goal_h)
         pred_img = self.image_decoder(pred_latent)
@@ -198,6 +220,8 @@ class HierarchicalAutoregressivePolicy(nn.Module):
             "predicted_backward_states": self.bwd_head(bwd_h).view(-1, h_cfg.backward_steps, h_cfg.state_dim),
             "predicted_forward_states": self.fwd_head(fwd_h).view(-1, h_cfg.forward_steps, h_cfg.state_dim),
             "predicted_goal_images": pred_img,
+            # [FIX] Pass through progress_head to get shape [B, 1]
+            "predicted_progress": self.progress_head(prog_h),
         }
         return preds
 

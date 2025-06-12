@@ -33,7 +33,8 @@ def main():
         project=cfg.wandb.project,
         entity=cfg.wandb.entity,
         group=cfg.wandb.group,
-        mode=cfg.wandb.mode,
+        mode=cfg.wandb.mode if cfg.wandb.mode in (
+            "online", "offline", "disabled") else None,
         config=cfg.to_dict()  # Log all hyperparameters
     )
     # ---
@@ -154,7 +155,10 @@ def main():
                 language_instruction=language_instructions
             )
 
-            total_loss = compute_loss(predictions, batch_device)
+            # Get all losses including individual components
+            losses = compute_loss(predictions, batch_device)
+            # Extract the total loss for backward pass
+            total_loss = losses['total_loss']
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -165,12 +169,21 @@ def main():
                 current_lr = scheduler.get_last_lr()[0]
                 loss_value = total_loss.item()
 
-                # Log metrics to wandb
-                wandb.log({
-                    "train/loss": loss_value,
+                # Prepare log dictionary with all individual losses
+                log_dict = {
+                    "train/total_loss": loss_value,
                     "train/learning_rate": current_lr,
                     "step": step
-                })
+                }
+
+                # Add individual loss components to the log dictionary
+                for loss_name, loss_tensor in losses.items():
+                    if loss_name != 'total_loss':  # Skip total_loss as we've already logged it
+                        log_dict[f"train/{loss_name}"] = loss_tensor.item()
+
+                # Log all metrics to wandb
+                wandb.log(log_dict)
+
                 progress_bar.set_postfix(
                     {"Loss": f"{loss_value:.4f}", "LR": f"{current_lr:.6f}"})
 
