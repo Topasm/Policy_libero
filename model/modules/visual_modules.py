@@ -5,7 +5,7 @@ from transformers import AutoModel, AutoTokenizer, CLIPTextModel
 from einops import rearrange, repeat
 # [MODIFIED] Import for resizing
 import torchvision.transforms.functional as TF
-from model.predictor.config import VisionEncoderConfig, LanguageEncoderConfig
+from config.config import VisionEncoderConfig, LanguageEncoderConfig
 
 
 def exists(val):

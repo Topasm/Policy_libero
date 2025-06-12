@@ -4,7 +4,7 @@ from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from model.modeling_bidirectional_rtdiffusion import HierarchicalPolicy
 from model.invdyn.invdyn import MlpInvDynamic
-from model.predictor.config import PolicyConfig
+from config.config import PolicyConfig
 from model.predictor.policy import HierarchicalAutoregressivePolicy
 from libero.libero.envs import OffScreenRenderEnv
 from libero.libero.benchmark import get_benchmark_dict

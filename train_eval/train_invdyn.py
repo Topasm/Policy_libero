@@ -8,7 +8,7 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatas
 from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.policies.normalize import Normalize
 from model.invdyn.invdyn import MlpInvDynamic
-from model.predictor.config import PolicyConfig
+from config.config import PolicyConfig
 
 
 def compute_loss(batch: dict[str, Tensor], model: MlpInvDynamic, cfg: PolicyConfig) -> Tensor:

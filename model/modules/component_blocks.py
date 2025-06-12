@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import Dict
 
 from model.modules.visual_modules import ImageEncoder, ImageDecoder
-from model.predictor.config import HierarchicalPolicyConfig
+from config.config import HierarchicalPolicyConfig
 
 
 class InputBlock(nn.Module):
