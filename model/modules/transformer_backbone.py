@@ -2,21 +2,22 @@
 import torch
 from torch import nn, Tensor
 from typing import Optional, Callable
-
-# RMSNorm은 custom_transformer.py에서 가져오거나 여기에 복사할 수 있습니다.
-# 여기서는 의존성을 줄이기 위해 직접 정의합니다.
+from torch.nn import functional as F
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-8):
-        super().__init__()
-        self.scale = dims**-0.5
-        self.eps = eps
-        self.gamma = nn.Parameter(torch.ones(dims))
+    """ A wrapper for torch.nn.functional.rms_norm """
 
-    def forward(self, x):
-        norm_x = x.norm(2, dim=-1, keepdim=True)
-        return x / (norm_x * self.scale + self.eps) * self.gamma
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        # The learnable scaling parameter, gamma
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x: Tensor) -> Tensor:
+        # [FIXED] Call F.rms_norm with the correct arguments
+        # The normalized_shape is derived from the shape of the learnable weight.
+        return F.rms_norm(x, self.weight.shape, self.weight, self.eps)
 
 
 class FeedForward(nn.Module):
@@ -36,8 +37,8 @@ class FeedForward(nn.Module):
 
 class CustomDecoderLayer(nn.Module):
     """
-    A custom Transformer Decoder-style layer that uses pre-LayerNorm.
-    It performs self-attention only.
+    A custom Transformer Decoder-style layer that uses pre-normalization.
+    Now correctly uses the RMSNorm wrapper.
     """
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
@@ -51,26 +52,25 @@ class CustomDecoderLayer(nn.Module):
             d_model, nhead, dropout=dropout, batch_first=True)
         self.ffn = FeedForward(d_model, dim_feedforward, dropout, activation)
 
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        # These now correctly instantiate the fixed RMSNorm class
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
     def forward(self, src: Tensor, src_mask: Optional[Tensor] = None) -> Tensor:
-        # Pre-Norm structure
         x = src
-        # Self-attention block
         attn_out, _ = self.self_attn(self.norm1(x), self.norm1(
             x), self.norm1(x), attn_mask=src_mask)
         x = x + self.dropout1(attn_out)
-        # Feed-forward block
         ffn_out = self.ffn(self.norm2(x))
         x = x + self.dropout2(ffn_out)
         return x
 
 
 class CustomDecoder(nn.Module):
-    """ A stack of N custom decoder layers. """
+    """ A stack of N custom decoder layers with U-Net like skip connections. """
 
     def __init__(self, decoder_layer: nn.Module, num_layers: int, norm: Optional[nn.Module] = None):
         super().__init__()
@@ -78,10 +78,29 @@ class CustomDecoder(nn.Module):
         self.num_layers = num_layers
         self.norm = norm
 
+        # Add learnable weights for the skip connections
+        if self.num_layers % 2 != 0:
+            raise ValueError(
+                "U-Net skip connections require an even number of layers.")
+        self.skip_weights = nn.Parameter(torch.ones(num_layers // 2))
+
     def forward(self, src: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         output = src
-        for mod in self.layers:
-            output = mod(output, src_mask=mask)
+        skip_connections = []
+        num_skips = self.num_layers // 2
+
+        # U-Net Style Forward Pass
+        for i in range(self.num_layers):
+            if i >= num_skips:
+                skip_connection = skip_connections.pop()
+                weight_index = self.num_layers - 1 - i
+                output = output + \
+                    self.skip_weights[weight_index] * skip_connection
+
+            output = self.layers[i](output, src_mask=mask)
+
+            if i < num_skips:
+                skip_connections.append(output)
 
         if self.norm is not None:
             output = self.norm(output)

@@ -180,18 +180,20 @@ def main():
                 torch.save(model.state_dict(), ckpt_path)
                 tqdm.write(f"\nSaved checkpoint: {ckpt_path}")
 
-                # MODIFIED: Image Logging Logic for only the front view
-                pred_img_front = predictions['predicted_goal_image_front'][0].cpu().clamp(
+                # --- [FIXED] Use the correct key for the predicted image ---
+                # The model now returns a single image under the key 'predicted_goal_images'.
+                pred_img_front = predictions['predicted_goal_images'][0].cpu().clamp(
                     0, 1)
 
-                # true_img_front is the first image in the goal_images stack
+                # Get the ground truth images for comparison.
                 true_img_front = batch_device['goal_images'][0, 0].cpu()
+                true_img_wrist = batch_device['goal_images'][0, 1].cpu()
 
+                # Log the single prediction and the ground truths.
                 wandb.log({
                     "predictions/goal_image_front": wandb.Image(pred_img_front),
                     "ground_truth/goal_image_front": wandb.Image(true_img_front),
-                    # REMOVED logging for "predictions/goal_image_wrist"
-                    # REMOVED logging for "ground_truth/goal_image_wrist"
+                    "ground_truth/goal_image_wrist": wandb.Image(true_img_wrist),
                     "step": step
                 })
                 # --- END FIX ---

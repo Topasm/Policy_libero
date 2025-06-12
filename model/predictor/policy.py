@@ -20,7 +20,7 @@ from typing import Dict
 
 from config.config import PolicyConfig
 from model.modules.visual_modules import ImageEncoder, ImageDecoder, LanguageEncoder
-from model.modules.transformer_backbone import CustomDecoder, CustomDecoderLayer
+from model.modules.transformer_backbone import CustomDecoder, CustomDecoderLayer, RMSNorm
 
 
 def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -80,7 +80,7 @@ class HierarchicalAutoregressivePolicy(nn.Module):
 
         for param in self.image_encoder.vit.parameters():
             param.requires_grad = False
-            print("Froze ImageEncoder (ViT) backbone.")
+        print("Froze ImageEncoder (ViT) backbone.")
 
         # [MODIFIED] Reverted to a single, unified state encoder
         self.state_projection = nn.Linear(h_cfg.state_dim, h_cfg.hidden_dim)
@@ -116,7 +116,7 @@ class HierarchicalAutoregressivePolicy(nn.Module):
             activation=F.gelu, batch_first=True
         )
         self.multi_modal_backbone = CustomDecoder(
-            decoder_layer, num_layers=h_cfg.num_layers, norm=nn.LayerNorm(
+            decoder_layer, num_layers=h_cfg.num_layers, norm=RMSNorm(
                 h_cfg.hidden_dim)
         )
 
