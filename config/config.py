@@ -38,7 +38,7 @@ class HierarchicalTransformerConfig:
     """[MODIFIED] Configuration for the Hierarchical Autoregressive Transformer policy, inspired by Seer."""
     state_dim: int = 8  # Dynamically set from data
     hidden_dim: int = 384
-    num_layers: int = 16
+    num_layers: int = 12
     num_heads: int = 12    # Seer uses 12
     dropout: float = 0.1
     forward_steps: int = 32

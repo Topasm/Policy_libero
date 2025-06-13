@@ -6,18 +6,48 @@ from torch.nn import functional as F
 
 
 class RMSNorm(nn.Module):
-    """ A wrapper for torch.nn.functional.rms_norm """
+    def __init__(self, d, p=-1., eps=1e-8, bias=False):
+        """
+            Root Mean Square Layer Normalization
+        :param d: model size
+        :param p: partial RMSNorm, valid value [0, 1], default -1.0 (disabled)
+        :param eps:  epsilon value, default 1e-8
+        :param bias: whether use bias term for RMSNorm, disabled by
+            default because RMSNorm doesn't enforce re-centering invariance.
+        """
+        super(RMSNorm, self).__init__()
 
-    def __init__(self, d_model: int, eps: float = 1e-6):
-        super().__init__()
         self.eps = eps
-        # The learnable scaling parameter, gamma
-        self.weight = nn.Parameter(torch.ones(d_model))
+        self.d = d
+        self.p = p
+        self.bias = bias
 
-    def forward(self, x: Tensor) -> Tensor:
-        # [FIXED] Call F.rms_norm with the correct arguments
-        # The normalized_shape is derived from the shape of the learnable weight.
-        return F.rms_norm(x, self.weight.shape, self.weight, self.eps)
+        self.scale = nn.Parameter(torch.ones(d))
+        self.register_parameter("scale", self.scale)
+
+        if self.bias:
+            self.offset = nn.Parameter(torch.zeros(d))
+            self.register_parameter("offset", self.offset)
+
+    def forward(self, x):
+        if self.p < 0. or self.p > 1.:
+            norm_x = x.norm(2, dim=-1, keepdim=True)
+            d_x = self.d
+        else:
+            partial_size = int(self.d * self.p)
+            partial_x, _ = torch.split(
+                x, [partial_size, self.d - partial_size], dim=-1)
+
+            norm_x = partial_x.norm(2, dim=-1, keepdim=True)
+            d_x = partial_size
+
+        rms_x = norm_x * d_x ** (-1. / 2)
+        x_normed = x / (rms_x + self.eps)
+
+        if self.bias:
+            return self.scale * x_normed + self.offset
+
+        return self.scale * x_normed
 
 
 class FeedForward(nn.Module):
@@ -70,7 +100,7 @@ class CustomDecoderLayer(nn.Module):
 
 
 class CustomDecoder(nn.Module):
-    """ A stack of N custom decoder layers. """
+    """ A stack of N custom decoder layers with U-Net like skip connections. """
 
     def __init__(self, decoder_layer: nn.Module, num_layers: int, norm: Optional[nn.Module] = None):
         super().__init__()
@@ -78,10 +108,30 @@ class CustomDecoder(nn.Module):
         self.num_layers = num_layers
         self.norm = norm
 
+        # [MODIFIED] Add learnable weights for the skip connections
+        if self.num_layers % 2 != 0:
+            raise ValueError(
+                "U-Net skip connections require an even number of layers.")
+        self.skip_weights = nn.Parameter(torch.ones(num_layers // 2))
+
     def forward(self, src: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         output = src
-        for mod in self.layers:
-            output = mod(output, src_mask=mask)
+        skip_connections = []
+        num_skips = self.num_layers // 2
+
+        # --- [MODIFIED] U-Net Style Forward Pass ---
+        for i in range(self.num_layers):
+            if i >= num_skips:
+                skip_connection = skip_connections.pop()
+                weight_index = self.num_layers - 1 - i
+                output = output + \
+                    self.skip_weights[weight_index] * skip_connection
+
+            output = self.layers[i](output, src_mask=mask)
+
+            if i < num_skips:
+                skip_connections.append(output)
+        # ---
 
         if self.norm is not None:
             output = self.norm(output)
