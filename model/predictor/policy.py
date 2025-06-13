@@ -169,50 +169,46 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         lang_embed = self.language_encoder(language_instruction).unsqueeze(1)
         lang_embed_proj = self.lang_projection(lang_embed)
 
-        # --- 2. 전체 시퀀스 조립 및 위치 임베딩 추가 ---
-        seq = torch.cat([
-            lang_embed_proj, state_embeds, img_embeds,
+       # 2. 전체 시퀀스 조립
+        history_embeds = torch.cat(
+            [lang_embed_proj, state_embeds, img_embeds], dim=1)
+        query_embeds = torch.cat([
             self.progress_query.expand(batch_size, -1, -1),
             self.goal_query.expand(batch_size, -1, -1),
             self.bwd_query.expand(batch_size, -1, -1),
-            self.fwd_query.expand(batch_size, -1, -1),
-
+            self.fwd_query.expand(batch_size, -1, -1)
         ], dim=1)
+        seq = torch.cat([history_embeds, query_embeds], dim=1)
         seq = seq + self.pos_embed[:, :seq.shape[1], :]
 
-        # --- 3. 커스텀 어텐션 마스크 생성 ---
+        # 3. [FIXED] 커스텀 어텐션 마스크 및 인덱스 계산 순서 수정
         seq_len = seq.shape[1]
         custom_mask_bool = torch.ones(
             seq_len, seq_len, device=seq.device, dtype=torch.bool).triu(1)
 
-        hist_len = lang_embed_proj.size(
-            1) + state_embeds.size(1) + img_embeds.size(1)
-        goal_start = hist_len
+        hist_len = history_embeds.size(1)
+        prog_start = hist_len
+        goal_start = prog_start + 1
         bwd_start = goal_start + h_cfg.num_goal_tokens
         fwd_start = bwd_start + h_cfg.num_bwd_tokens
         prog_start = fwd_start + h_cfg.num_fwd_tokens
 
-        # [MODIFIED] Update mask logic for the new hierarchy
-        # All queries see history
         custom_mask_bool[prog_start:, :hist_len] = False
-        # Goal, Bwd, Fwd see Progress
         custom_mask_bool[goal_start:, prog_start:goal_start] = False
-        # Bwd, Fwd see Goal
         custom_mask_bool[bwd_start:, goal_start:bwd_start] = False
-        # Fwd sees Bwd
         custom_mask_bool[fwd_start:, bwd_start:fwd_start] = False
 
-        # --- 4. CustomDecoder 백본 실행 ---
+        # --- 4. 백본 실행 ---
         out = self.multi_modal_backbone(seq, mask=custom_mask_bool)
 
-        # --- 5. 결과 슬라이싱 및 최종 예측 ---
+        # --- 5. [FIXED] 올바른 인덱스로 결과 슬라이싱 ---
+        prog_h = out[:, prog_start: prog_start + 1].mean(dim=1)
         goal_h = out[:, goal_start: goal_start +
                      h_cfg.num_goal_tokens].mean(dim=1)
         bwd_h = out[:, bwd_start: bwd_start + h_cfg.num_bwd_tokens].mean(dim=1)
         fwd_h = out[:, fwd_start: fwd_start + h_cfg.num_fwd_tokens].mean(dim=1)
-        prog_h = out[:, prog_start: prog_start +
-                     1].mean(dim=1)  # Progress head
 
+        # --- 6. 최종 예측 생성 ---
         pred_latent = self.goal_head(goal_h)
         pred_img = self.image_decoder(pred_latent)
 
@@ -220,8 +216,8 @@ class HierarchicalAutoregressivePolicy(nn.Module):
             "predicted_backward_states": self.bwd_head(bwd_h).view(-1, h_cfg.backward_steps, h_cfg.state_dim),
             "predicted_forward_states": self.fwd_head(fwd_h).view(-1, h_cfg.forward_steps, h_cfg.state_dim),
             "predicted_goal_images": pred_img,
-            # [FIX] Pass through progress_head to get shape [B, 1]
-            "predicted_progress": self.progress_head(prog_h),
+            # [FIXED] sigmoid 추가
+            "predicted_progress": torch.sigmoid(self.progress_head(prog_h)),
         }
         return preds
 
