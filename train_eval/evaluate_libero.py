@@ -44,7 +44,7 @@ def _quat2axisangle(quat):
 @dataclass
 class EvalConfig:
     # --- 필수 설정 ---
-    planner_checkpoint_path: str = "outputs/train/bidirectional_transformer/model_final.pth"
+    planner_checkpoint_path: str = "outputs/train/bidirectional_transformer2/model_final.pth"
     invdyn_checkpoint_path: str = "outputs/train/invdyn_only/invdyn_final.pth"
 
     # --- LIBERO 벤치마크 설정 ---
