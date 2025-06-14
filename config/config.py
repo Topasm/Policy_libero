@@ -72,7 +72,7 @@ class DataConfig:
     dataset_repo_id: str = "lerobot/libero_object_image"
     image_keys: List[str] = field(default_factory=lambda: [
                                   "observation.images.image", "observation.images.wrist_image"])
-    n_obs_steps: int = 5       # Seer uses a history length of 7 for LIBERO
+    n_obs_steps: int = 7       # Seer uses a history length of 7 for LIBERO
     horizon: int = 16
     n_action_steps: int = 1
     diffusion_target_key: str = "observation.state"
@@ -95,8 +95,8 @@ class DataConfig:
 @dataclass
 class TrainingConfig:
     """[MODIFIED] Configuration for training, inspired by Seer."""
-    training_steps: int = 50000  # A more realistic number of steps
-    batch_size: int = 32      # Seer uses a large batch size for finetuning
+    training_steps: int = 30000  # A more realistic number of steps
+    batch_size: int = 64      # Seer uses a large batch size for finetuning
     # Seer uses 1e-3 for FT, but 1e-4 is a safer starting point for pre-training
     learning_rate: float = 1e-4
     weight_decay: float = 1e-6
