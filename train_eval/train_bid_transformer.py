@@ -24,7 +24,7 @@ from model.predictor.normalization_utils import KeyMappingNormalizer
 def main():
     """Main training function."""
     cfg = PolicyConfig()
-    output_directory = Path("outputs/train/bidirectional_transformer2")
+    output_directory = Path("outputs/train/bidirectional_transformero")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -192,18 +192,18 @@ def main():
                 torch.save(model.state_dict(), ckpt_path)
                 tqdm.write(f"\nSaved checkpoint: {ckpt_path}")
 
-                # --- [FIXED] Use the correct key for the predicted image ---
-                # The model now returns a single image under the key 'predicted_goal_images'.
-                pred_img_front = predictions['predicted_goal_images'][0].cpu().clamp(
+                # --- [MODIFIED] Image Logging Logic for both predicted views ---
+                pred_img_front = predictions['predicted_goal_image_front'][0].cpu().clamp(
+                    0, 1)
+                pred_img_wrist = predictions['predicted_goal_image_wrist'][0].cpu().clamp(
                     0, 1)
 
-                # Get the ground truth images for comparison.
                 true_img_front = batch_device['goal_images'][0, 0].cpu()
                 true_img_wrist = batch_device['goal_images'][0, 1].cpu()
 
-                # Log the single prediction and the ground truths.
                 wandb.log({
                     "predictions/goal_image_front": wandb.Image(pred_img_front),
+                    "predictions/goal_image_wrist": wandb.Image(pred_img_wrist),
                     "ground_truth/goal_image_front": wandb.Image(true_img_front),
                     "ground_truth/goal_image_wrist": wandb.Image(true_img_wrist),
                     "step": step

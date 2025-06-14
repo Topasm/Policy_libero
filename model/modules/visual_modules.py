@@ -59,7 +59,7 @@ class PerceiverAttention(nn.Module):
 
 
 class PerceiverResampler(nn.Module):
-    def __init__(self, *, dim, depth=2, dim_head=64, heads=8, num_latents=64, ff_mult=4):
+    def __init__(self, *, dim, depth=3, dim_head=64, heads=8, num_latents=9, ff_mult=4):
         super().__init__()
         self.latents = nn.Parameter(torch.randn(num_latents, dim))
         self.layers = nn.ModuleList([])
@@ -89,51 +89,49 @@ class ImageEncoder(nn.Module):
         self.vit = AutoModel.from_pretrained(cfg.vision_backbone)
         self.vit.config.image_size = cfg.image_size
 
-        # [MODIFIED] Use the num_latents value from the config
         self.resampler = PerceiverResampler(
             dim=self.vit.config.hidden_size,
-            depth=2,
-            num_latents=cfg.num_latents_per_image,  # 설정값 사용
-            heads=8,
-            dim_head=64,
+            depth=2, num_latents=cfg.num_query_per_image, heads=8, dim_head=64,
         )
-        self.projection = nn.Linear(
+        # Patch token projection only
+        self.patch_token_projection = nn.Linear(
             self.vit.config.hidden_size, cfg.image_latent_dim)
 
-        for param in self.vit.parameters():
-            param.requires_grad = False
-        print("Froze ImageEncoder (ViT) backbone.")
-
-    def forward(self, image_tensor_3ch):
+    def forward(self, image_tensor_3ch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        [MODIFIED] Returns both resampled patch tokens and the original [CLS] token.
+        """
         resized_images = TF.resize(
             image_tensor_3ch, [self.cfg.image_size, self.cfg.image_size], antialias=True)
 
-        outputs = self.vit(pixel_values=resized_images)
-        image_feats = outputs.last_hidden_state[:, 1:, :]  # Ignore CLS token
+        all_tokens = self.vit(pixel_values=resized_images).last_hidden_state
+        cls_token = all_tokens[:, :1, :]      # Shape: (B, 1, hidden)
+        patch_tokens = all_tokens[:, 1:, :]   # Shape: (B, N, hidden)
 
-        resampled_feats = self.resampler(image_feats)
-        projected_feats = self.projection(resampled_feats)
+        resampled_patch_tokens = self.resampler(patch_tokens)
+        projected_patch_tokens = self.patch_token_projection(
+            resampled_patch_tokens)
 
-        # [MODIFIED] Return the whole sequence of latent vectors, instead of the mean.
-        # Shape: (B, num_latents, image_latent_dim) e.g. (B, 64, 512)
-        return projected_feats
+        return projected_patch_tokens, cls_token  # Return both types of tokens
 
 
 # --- [MODIFIED] Rewritten LanguageEncoder using open_clip ---
 class LanguageEncoder(nn.Module):
     def __init__(self, cfg: LanguageEncoderConfig):
         super().__init__()
-        # [MODIFIED] Use both model_name and pretrained path to load the model
+        # [FIX] Use model_name for model, pretrained for weights, and model_name for tokenizer
         try:
             self.model, _ = create_model_from_pretrained(
-                model_name=cfg.pretrained
+                model_name=cfg.model_name, pretrained=cfg.pretrained
             )
         except Exception as e:
             print(
-                f"Error loading model with specified name '{cfg.model_name}'. Check available models in open_clip.")
+                f"Error loading model with model_name='{cfg.model_name}', pretrained='{cfg.pretrained}'. Check available models in open_clip."
+            )
             raise e
 
-        self.tokenizer = get_tokenizer(cfg.pretrained)
+        # [FIX] Use model_name for tokenizer to avoid tokenizer mismatch
+        self.tokenizer = get_tokenizer(cfg.model_name)
 
         for param in self.model.parameters():
             param.requires_grad = False
@@ -144,7 +142,6 @@ class LanguageEncoder(nn.Module):
             self._proj_dtype = lambda: self.projection.weight.dtype
         else:
             self.projection = nn.Identity()
-            # [FIX] Use model's device/dtype if projection is Identity
             self._proj_device = lambda: next(self.model.parameters()).device
             self._proj_dtype = lambda: next(self.model.parameters()).dtype
 
@@ -181,8 +178,15 @@ class ImageDecoder(nn.Module):
                                kernel_size=4, stride=2, padding=1), nn.Sigmoid()
         )
 
-    # [MODIFIED] Reverted to single-latent-input, single-image-output structure.
-    def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        """ Decodes a single latent vector into a single image. """
-        x = self.initial_linear(latents).view(-1, 512, 4, 4)
-        return self.decoder(x)
+    # [MODIFIED] The forward method now accepts two latents and returns two images.
+    def forward(self, latent_front: torch.Tensor, latent_wrist: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """ Decodes two latent vectors into two separate images by reusing the same decoder weights. """
+        # Decode front image
+        x_front = self.initial_linear(latent_front).view(-1, 512, 4, 4)
+        pred_front = self.decoder(x_front)
+
+        # Decode wrist image
+        x_wrist = self.initial_linear(latent_wrist).view(-1, 512, 4, 4)
+        pred_wrist = self.decoder(x_wrist)
+
+        return pred_front, pred_wrist

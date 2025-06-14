@@ -29,16 +29,18 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
         'forward_state_loss': 1.0,
         'backward_state_loss': 1.0,
         'goal_image_loss': 1.0,
-        'progress_loss': 0.5  # 진행률 손실 가중치
+        'progress_loss': 0.5
     }
 
-    if 'predicted_goal_images' in predictions and 'goal_images' in targets:
-        pred_img = predictions['predicted_goal_images']
-        true_img_front = targets['goal_images'][:, 0]
-        if pred_img.shape[2:] != true_img_front.shape[2:]:
-            true_img_front = F.interpolate(
-                true_img_front, size=pred_img.shape[2:], mode='bilinear', align_corners=False)
-        losses['goal_image_loss'] = F.mse_loss(pred_img, true_img_front)
+    # [MODIFIED] Calculate loss for both front and wrist goal images
+    if 'predicted_goal_image_front' in predictions and 'goal_images' in targets:
+        pred_front = predictions['predicted_goal_image_front']
+        pred_wrist = predictions['predicted_goal_image_wrist']
+        true_front = targets['goal_images'][:, 0]
+        true_wrist = targets['goal_images'][:, 1]
+        loss_front = F.mse_loss(pred_front, true_front)
+        loss_wrist = F.mse_loss(pred_wrist, true_wrist)
+        losses['goal_image_loss'] = loss_front + loss_wrist
 
     if 'predicted_forward_states' in predictions and 'forward_states' in targets:
         losses['forward_state_loss'] = F.l1_loss(
@@ -48,7 +50,6 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
         losses['backward_state_loss'] = F.l1_loss(
             predictions['predicted_backward_states'], targets['backward_states'])
 
-    # [MODIFIED] Ensure progress loss is calculated
     if 'predicted_progress' in predictions and 'normalized_timestep' in targets:
         predicted = predictions['predicted_progress'].squeeze(-1)
         target = targets['normalized_timestep']
@@ -56,15 +57,10 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
 
     total_loss = torch.tensor(0.0, device=next(
         iter(predictions.values())).device)
-
-    # Calculate weighted sum of losses
     for name, loss in losses.items():
         if name in weights and loss is not None:
             total_loss += loss * weights.get(name, 1.0)
-
-    # Add the total loss to the dictionary
     losses['total_loss'] = total_loss
-
     return losses
 
 
@@ -83,6 +79,11 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         self.state_projection = nn.Linear(h_cfg.state_dim, h_cfg.hidden_dim)
         self.lang_projection = nn.Linear(
             l_cfg.projection_dim, h_cfg.hidden_dim)
+
+        # [MODIFIED] Add a separate projector for the [CLS] token
+        self.cls_token_projector = nn.Linear(768, h_cfg.hidden_dim)
+
+        # 기존 image_token_projector는 이제 패치 토큰 전용입니다.
         if v_cfg.image_latent_dim != h_cfg.hidden_dim:
             self.image_token_projector = nn.Linear(
                 v_cfg.image_latent_dim, h_cfg.hidden_dim)
@@ -102,7 +103,7 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         num_lang_tokens = 1
         num_state_tokens = d_cfg.n_obs_steps
         num_image_tokens = d_cfg.n_obs_steps * \
-            v_cfg.num_latents_per_image * len(d_cfg.image_keys)
+            v_cfg.num_query_per_image * len(d_cfg.image_keys)
         num_query_tokens = 1 + h_cfg.num_goal_tokens + \
             h_cfg.num_bwd_tokens + h_cfg.num_fwd_tokens  # Now 4 queries
         max_len = num_lang_tokens + num_state_tokens + \
@@ -120,12 +121,15 @@ class HierarchicalAutoregressivePolicy(nn.Module):
                 h_cfg.hidden_dim)
         )
 
-        self.goal_head = nn.Linear(h_cfg.hidden_dim, v_cfg.image_latent_dim)
+        # [MODIFIED] Create two separate prediction heads for goal latents
+        self.goal_head_front = nn.Linear(
+            h_cfg.hidden_dim, v_cfg.image_latent_dim)
+        self.goal_head_wrist = nn.Linear(
+            h_cfg.hidden_dim, v_cfg.image_latent_dim)
         self.bwd_head = nn.Linear(
             h_cfg.hidden_dim, h_cfg.backward_steps * h_cfg.state_dim)
         self.fwd_head = nn.Linear(
             h_cfg.hidden_dim, h_cfg.forward_steps * h_cfg.state_dim)
-        # [MODIFIED] Add a new head for progress prediction
         self.progress_head = nn.Linear(h_cfg.hidden_dim, 1)
 
     def forward(self, initial_images, initial_states, language_instruction, **kwargs):
@@ -134,15 +138,26 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         h_cfg = self.config.hierarchical_transformer
 
         # 1. Input Embedding
+        # --- [MODIFIED] Vision processing to handle both patch and CLS tokens ---
         images_flat = initial_images.flatten(0, 1)
         front_images, wrist_images = images_flat[:, 0], images_flat[:, 1]
-        front_tokens, wrist_tokens = self.image_encoder(
-            front_images), self.image_encoder(wrist_images)
-        front_tokens, wrist_tokens = self.image_token_projector(
-            front_tokens), self.image_token_projector(wrist_tokens)
-        image_tokens = torch.cat([front_tokens, wrist_tokens], dim=1)
+
+        # ImageEncoder가 이제 두 종류의 토큰을 반환합니다.
+        front_patch_tokens, front_cls = self.image_encoder(front_images)
+        wrist_patch_tokens, wrist_cls = self.image_encoder(wrist_images)
+
+        # 각 토큰 종류에 맞는 프로젝터를 적용합니다.
+        front_patch_tokens = self.image_token_projector(front_patch_tokens)
+        wrist_patch_tokens = self.image_token_projector(wrist_patch_tokens)
+        front_cls_embed = self.cls_token_projector(front_cls)
+        wrist_cls_embed = self.cls_token_projector(wrist_cls)
+
+        # 모든 시각 토큰들을 결합합니다.
+        image_tokens = torch.cat(
+            [front_patch_tokens, wrist_patch_tokens, front_cls_embed, wrist_cls_embed], dim=1)
         img_embeds = image_tokens.view(
             batch_size, n_obs_steps * image_tokens.shape[1], -1)
+
         state_embeds = self.state_projection(initial_states)
         lang_embed = self.language_encoder(language_instruction).unsqueeze(1)
         lang_embed_proj = self.lang_projection(lang_embed)
@@ -194,11 +209,17 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         bwd_h = out[:, bwd_start: bwd_start + h_cfg.num_bwd_tokens].mean(dim=1)
         fwd_h = out[:, fwd_start: fwd_start + h_cfg.num_fwd_tokens].mean(dim=1)
 
+        # [MODIFIED] Predict two separate latents and decode them into two images
+        pred_latent_front = self.goal_head_front(goal_h)
+        pred_latent_wrist = self.goal_head_wrist(goal_h)
+        pred_img_front, pred_img_wrist = self.image_decoder(
+            pred_latent_front, pred_latent_wrist)
+
         preds = {
             "predicted_backward_states": self.bwd_head(bwd_h).view(-1, h_cfg.backward_steps, h_cfg.state_dim),
             "predicted_forward_states": self.fwd_head(fwd_h).view(-1, h_cfg.forward_steps, h_cfg.state_dim),
-            "predicted_goal_images": self.image_decoder(self.goal_head(goal_h)),
-            # Add progress prediction
+            "predicted_goal_image_front": pred_img_front,
+            "predicted_goal_image_wrist": pred_img_wrist,
             "predicted_progress": torch.sigmoid(self.progress_head(prog_h)),
         }
         return preds

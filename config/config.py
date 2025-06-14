@@ -17,18 +17,18 @@ class VisionEncoderConfig:
     image_size: int = 224
     image_latent_dim: int = 512
     image_channels: int = 3
-    num_latents_per_image: int = 64
+    num_query_per_image: int = 9
 
 
 @dataclass
 class LanguageEncoderConfig:
     """[MODIFIED] Configuration for the open_clip language encoder."""
     # The base architecture name known to the open_clip library
-    model_name: str = "OpenVision-ViT-Small"
+    model_name: str = "ViT-B-16-SigLIP2"
     # The Hugging Face Hub repository ID where the weights are stored
-    pretrained: str = "hf-hub:UCSC-VLAA/openvision-vit-small-patch16-224"
+    pretrained: str = "webli"
     # ViT-Small has an embedding dimension of 384
-    embedding_dim: int = 384
+    embedding_dim: int = 768
     # Project to the main transformer's hidden dimension (which is also 384)
     projection_dim: int = 384
 
@@ -69,12 +69,12 @@ class StateDiffusionConfig:
 @dataclass
 class DataConfig:
     """[MODIFIED] Configuration for data loading and processing, inspired by Seer."""
-    dataset_repo_id: str = "yongjincho/libero"
+    dataset_repo_id: str = "lerobot/libero_object_image"
     image_keys: List[str] = field(default_factory=lambda: [
-                                  "observation.images.front", "observation.images.wrist"])
+                                  "observation.images.image", "observation.images.wrist_image"])
     n_obs_steps: int = 5       # Seer uses a history length of 7 for LIBERO
     horizon: int = 16
-    n_action_steps: int = 3
+    n_action_steps: int = 1
     diffusion_target_key: str = "observation.state"
     interpolate_state: bool = True
     state_delta_indices: List[int] = field(
@@ -100,8 +100,8 @@ class TrainingConfig:
     # Seer uses 1e-3 for FT, but 1e-4 is a safer starting point for pre-training
     learning_rate: float = 1e-4
     weight_decay: float = 1e-6
-    log_freq: int = 100
-    save_freq: int = 1000
+    log_freq: int = 1000
+    save_freq: int = 3000
     num_workers: int = 4
     lr_scheduler_T_max_mult: int = 1
 

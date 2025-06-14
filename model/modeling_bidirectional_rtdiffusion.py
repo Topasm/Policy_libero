@@ -76,11 +76,11 @@ class HierarchicalPolicy(nn.Module):
 
         state_plan = self._generate_state_plan(model_input_batch)
         actions_normalized = self._generate_actions_from_states(state_plan)
-        # actions_denormalized = self.unnormalize_outputs(
-        #     {"action": actions_normalized})["action"]
+        actions_denormalized = self.unnormalize_outputs(
+            {"action": actions_normalized})["action"]
 
         # Return a list of action tensors
-        return list(actions_normalized.squeeze(0))
+        return list(actions_denormalized.squeeze(0))
 
     def _generate_state_plan(self, model_input_batch: dict) -> torch.Tensor:
         """Generates a sequence of future states using the planner."""
