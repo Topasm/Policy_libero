@@ -13,33 +13,38 @@ from config.config import PolicyConfig
 
 def compute_loss(batch: dict[str, Tensor], model: MlpInvDynamic, cfg: PolicyConfig) -> Tensor:
     """
-    Computes the inverse dynamics loss for the separated model.
+    Computes separate L1 loss for arm and BCE loss for gripper.
     """
     all_states = batch["observation.state"]
     s_t = all_states[:, :-1]
     s_t_plus_1 = all_states[:, 1:]
-    true_actions = batch["action"]
+    true_actions = batch["action"]  # Shape: (B, T-1, 7)
 
-    # The new model expects separate s_t and s_{t+1}
-    pred_actions = model(s_t, s_t_plus_1)
+    # pred_actions_7d는 [pred_arm_6d, pred_gripper_logit_1d] 형태
+    pred_actions_7d = model(s_t, s_t_plus_1)
 
-    num_actions = min(pred_actions.shape[1], true_actions.shape[1])
-    pred_actions = pred_actions[:, :num_actions]
-    true_actions = true_actions[:, :num_actions]
+    # 1. 예측값과 정답값을 팔과 그리퍼로 분리
+    pred_arm = pred_actions_7d[..., :6]
+    pred_gripper_logit = pred_actions_7d[..., 6:]  # 모델이 로짓을 출력
 
-    if "action_is_pad" in batch:
-        pad_mask = batch["action_is_pad"][:, :num_actions]
-        mask = ~pad_mask
+    true_arm = true_actions[..., :6]
+    true_gripper = true_actions[..., 6:]
 
-        loss_per_element = F.mse_loss(
-            pred_actions, true_actions, reduction="none")
-        loss_per_element = loss_per_element * mask.unsqueeze(-1)
-        loss = loss_per_element.sum() / (mask.sum() *
-                                         pred_actions.shape[-1] + 1e-8)
-    else:
-        loss = F.mse_loss(pred_actions, true_actions)
+    # 2. 팔 행동에 대한 L1 Loss 계산
+    loss_arm = F.l1_loss(pred_arm, true_arm)
 
-    return loss
+    # 3. 그리퍼 행동에 대한 BCE Loss 계산
+    # BCE Loss를 위해 정답 그리퍼 값(-1, 1)을 (0, 1) 범위로 변환
+    true_gripper_bce = (true_gripper + 1.0) / 2.0
+    # F.binary_cross_entropy_with_logits는 sigmoid를 내장하고 있어 더 안정적
+    loss_gripper = F.binary_cross_entropy_with_logits(
+        pred_gripper_logit, true_gripper_bce
+    )
+
+    # 4. 가중치를 적용하여 전체 손실 계산
+    total_loss = loss_arm + cfg.inverse_dynamics.gripper_loss_weight * loss_gripper
+
+    return total_loss
 
 
 def main():
