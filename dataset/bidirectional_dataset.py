@@ -18,6 +18,7 @@ This dataset prepares training data in the format required by the bidirectional 
 import torch
 from typing import Dict, List, Optional
 from torch.utils.data import Dataset
+import torchvision.transforms as T  # [ADD] Import torchvision transforms
 
 
 class BidirectionalTrajectoryDataset(Dataset):
@@ -36,10 +37,10 @@ class BidirectionalTrajectoryDataset(Dataset):
         forward_steps: int = 16,
         backward_steps: int = 16,
         n_obs_steps: int = 1,
-        # 수정: 단일 이미지 키 대신 이미지 키 목록 사용
         image_keys: List[str] = ["observation.image"],
         state_key: str = "observation.state",
-        tasks: Optional[Dict[int, str]] = None
+        tasks: Optional[Dict[int, str]] = None,
+        is_train: bool = False  # [MODIFIED] Add is_train flag
     ):
         """
         양방향 데이터셋을 초기화합니다.
@@ -60,28 +61,27 @@ class BidirectionalTrajectoryDataset(Dataset):
         # 이미지 키 목록으로 변경
         self.image_keys = image_keys
         self.state_key = state_key
-        self.tasks = tasks  # Store the tasks mapping.
+        self.tasks = tasks  # [MODIFIED] Store tasks mapping
+        self.is_train = is_train
+
+        # [MODIFIED] Define augmentation pipelines
+        if self.is_train:
+            # Common resize transform for both cameras
+            self.resize = T.Resize((224, 224), antialias=True)
+
+            # Augmentations for the main camera (front view)
+            self.main_camera_aug = T.Compose([
+                T.RandomCrop(size=(224, 224), padding=int(
+                    224 * 0.05), padding_mode='edge'),  # Pad and crop
+                T.RandomRotation(degrees=5),
+                T.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5)
+            ])
+            # Augmentations for the wrist camera (only color jitter)
+            self.wrist_camera_aug = T.ColorJitter(
+                brightness=0.3, contrast=0.4, saturation=0.5)
 
         # Create valid trajectory samples
         self.samples = self._create_samples()
-
-    def _get_combined_image(self, data_item: Dict) -> torch.Tensor:
-        """
-        여러 이미지 키에서 이미지를 로드하고 채널 방향으로 연결합니다.
-        Helper to load and concatenate images from multiple keys.
-        """
-        images = []
-        for key in self.image_keys:
-            if key in data_item:
-                images.append(torch.as_tensor(
-                    data_item[key], dtype=torch.float32))
-
-        # 이미지가 없는 경우 처리
-        if not images:
-            raise KeyError(
-                f"None of the image keys {self.image_keys} found in data item")
-
-        return torch.cat(images, dim=0)
 
     def _create_samples(self):
         """
@@ -121,8 +121,6 @@ class BidirectionalTrajectoryDataset(Dataset):
                         'episode_idx': episode_idx,
                         'start_idx_forward_segment': current_start_idx,
                         'episode_true_end_idx': to_idx,
-                        # 언어 명령어가 있으면 추가
-                        'language_instruction': getattr(self.lerobot_dataset, 'task_description', "") if hasattr(self.lerobot_dataset, 'task_description') else ""
                     }
                     samples.append(sample)
         else:
@@ -181,31 +179,24 @@ class BidirectionalTrajectoryDataset(Dataset):
             초기 이미지, 초기 상태, 순방향 궤적 상태, 목표 이미지, 역방향 궤적 상태가 포함된 딕셔너리
         """
         sample_info = self.samples[idx]
+
         # --- 에피소드 시작/끝 인덱스 정보 가져오기 ---
         episode_abs_start_idx = None
         episode_true_end_idx = sample_info['episode_true_end_idx']
+
+        # 안전하게 에피소드 시작 인덱스 가져오기
         try:
             if hasattr(self.lerobot_dataset, 'episode_data_index') and 'from' in self.lerobot_dataset.episode_data_index:
                 episode_abs_start_idx = self.lerobot_dataset.episode_data_index['from'][sample_info['episode_idx']].item(
                 )
         except (AttributeError, KeyError, IndexError):
+            # 에피소드 데이터 인덱스가 없는 경우 추정값 사용
             episode_abs_start_idx = max(
                 0, episode_true_end_idx - self.backward_steps)
-
-        # --- Get Language Instruction using task_index ---
-        ref_data_item = self.lerobot_dataset[sample_info['start_idx_forward_segment']]
-        task_index = int(ref_data_item['task_index'].item(
-        )) if 'task_index' in ref_data_item else None
-        language_instruction = ""
-        if self.tasks and task_index is not None:
-            language_instruction = self.tasks.get(
-                task_index, f"Task with index {task_index} not found.")
-        # ...existing code...
 
         # --- 초기 이미지와 상태(시간적 이력) ---
         # --- Initial image(s) and state(s) (temporal history) ---
         if self.n_obs_steps > 1:
-            # 시간적 시퀀스: start_idx_forward_segment로 끝나는 n_obs_steps 관측값 수집
             initial_images = []
             initial_states = []
 
@@ -223,21 +214,48 @@ class BidirectionalTrajectoryDataset(Dataset):
                     obs_idx = len(self.lerobot_dataset) - 1
 
                 obs_data = self.lerobot_dataset[obs_idx]
-                # 수정: 여러 이미지 키를 처리하는 메서드 사용
-                initial_images.append(self._get_combined_image(obs_data))
+
+                # Load images as tensors
+                front_img = torch.as_tensor(
+                    obs_data[self.image_keys[0]], dtype=torch.float32)
+                wrist_img = torch.as_tensor(
+                    obs_data[self.image_keys[1]], dtype=torch.float32)
+
+                if self.is_train:
+                    # First, resize both to a consistent size
+                    front_img = self.resize(front_img)
+                    wrist_img = self.resize(wrist_img)
+                    # Then, apply specific augmentations
+                    front_img = self.main_camera_aug(front_img)
+                    wrist_img = self.wrist_camera_aug(wrist_img)
+
+                stacked_image = torch.stack([front_img, wrist_img])
+                initial_images.append(stacked_image)
                 initial_states.append(torch.as_tensor(
                     obs_data[self.state_key], dtype=torch.float32))
 
             # 텐서로 변환
+            # Shape: (N, num_cameras, 3, H, W)
             initial_images_tensor = torch.stack(initial_images)
             initial_states_tensor = torch.stack(initial_states)
         else:
             # 단일 관측: 이전 버전과의 호환성
             initial_data_idx = sample_info['start_idx_forward_segment']
             initial_data = self.lerobot_dataset[initial_data_idx]
-            # 수정: 여러 이미지 키를 처리하는 메서드 사용
-            initial_images_tensor = self._get_combined_image(
-                initial_data).unsqueeze(0)
+
+            # Load images as tensors
+            front_img = torch.as_tensor(
+                initial_data[self.image_keys[0]], dtype=torch.float32)
+            wrist_img = torch.as_tensor(
+                initial_data[self.image_keys[1]], dtype=torch.float32)
+
+            # --- [MODIFIED] Apply augmentations only during training ---
+            if self.is_train:
+                front_img = self.main_camera_aug(front_img)
+                wrist_img = self.wrist_camera_aug(wrist_img)
+
+            stacked_image = torch.stack([front_img, wrist_img])
+            initial_images_tensor = stacked_image.unsqueeze(0)
             initial_states_tensor = torch.as_tensor(
                 initial_data[self.state_key], dtype=torch.float32).unsqueeze(0)
 
@@ -252,7 +270,8 @@ class BidirectionalTrajectoryDataset(Dataset):
             if step_idx <= sample_info['episode_true_end_idx']:
                 # 경계 내에 있다면 실제 데이터를 로드
                 step_data = self.lerobot_dataset[step_idx]
-                state = step_data[self.state_key]
+                state = torch.as_tensor(
+                    step_data[self.state_key], dtype=torch.float32)
                 forward_states.append(state)
                 last_valid_state = state  # 마지막으로 유효했던 상태를 저장
             else:
@@ -260,30 +279,26 @@ class BidirectionalTrajectoryDataset(Dataset):
                 if last_valid_state is None:
                     # 이 경우는 start_idx 자체가 잘못된 경우지만, 방어 코드로 초기 상태 사용
                     initial_data = self.lerobot_dataset[sample_info['start_idx_forward_segment']]
-                    last_valid_state = initial_data[self.state_key]
+                    last_valid_state = torch.as_tensor(
+                        initial_data[self.state_key], dtype=torch.float32)
                 forward_states.append(last_valid_state)
 
         # --- 목표 이미지 로딩 ---
         # --- Goal image loading ---
         episode_end_data_idx = sample_info['episode_true_end_idx']
-        try:
-            episode_end_data = self.lerobot_dataset[episode_end_data_idx]
-            # 수정: 여러 이미지 키를 처리하는 메서드 사용
-            goal_image = self._get_combined_image(episode_end_data)
-            true_episode_end_state = torch.as_tensor(
-                episode_end_data[self.state_key], dtype=torch.float32)
-        except (IndexError, KeyError) as e:
-            # 오류 처리 - 가장 마지막 유효한 데이터 사용
-            print(
-                f"Error loading episode end data at idx {episode_end_data_idx}: {e}")
-            # 마지막 유효한 상태의 인덱스 찾기
-            valid_idx = min(episode_end_data_idx,
-                            len(self.lerobot_dataset) - 1)
-            episode_end_data = self.lerobot_dataset[valid_idx]
-            # 수정: 여러 이미지 키를 처리하는 메서드 사용
-            goal_image = self._get_combined_image(episode_end_data)
-            true_episode_end_state = torch.as_tensor(
-                episode_end_data[self.state_key], dtype=torch.float32)
+        episode_end_data = self.lerobot_dataset[episode_end_data_idx]
+
+        goal_front_img = torch.as_tensor(
+            episode_end_data[self.image_keys[0]], dtype=torch.float32)
+        goal_wrist_img = torch.as_tensor(
+            episode_end_data[self.image_keys[1]], dtype=torch.float32)
+
+        goal_front_img = self.resize(goal_front_img)
+        goal_wrist_img = self.resize(goal_wrist_img)
+
+        goal_image_tensor = torch.stack([goal_front_img, goal_wrist_img])
+        true_episode_end_state = torch.as_tensor(
+            episode_end_data[self.state_key], dtype=torch.float32)
 
         # --- 역방향 궤적 상태 (패딩 포함) ---
         # --- Backward trajectory states (with padding) ---
@@ -334,11 +349,13 @@ class BidirectionalTrajectoryDataset(Dataset):
             'initial_images': initial_images_tensor,
             'initial_states': initial_states_tensor,
             'forward_states': torch.stack([torch.as_tensor(s, dtype=torch.float32) for s in forward_states]),
-            'goal_images': goal_image,
+            'goal_images': goal_image_tensor,
             'backward_states': torch.stack(backward_states),
             'normalized_timestep': torch.tensor(normalized_timestep, dtype=torch.float32),
-            'language_instruction': language_instruction
+            # [MODIFIED] Will be set in __getitem__ using tasks mapping
+            'language_instruction': "",
         }
+
         return result
 
     @staticmethod

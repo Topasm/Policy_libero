@@ -17,7 +17,7 @@ from lerobot.configs.types import FeatureType
 
 from model.predictor.policy import HierarchicalAutoregressivePolicy, compute_loss
 from config.config import PolicyConfig
-from model.predictor.bidirectional_dataset import BidirectionalTrajectoryDataset
+from dataset.bidirectional_dataset import BidirectionalTrajectoryDataset
 from model.predictor.normalization_utils import KeyMappingNormalizer
 
 
