@@ -18,6 +18,7 @@ This dataset prepares training data in the format required by the bidirectional 
 import torch
 from typing import Dict, List, Optional
 from torch.utils.data import Dataset
+import torchvision.transforms as T  # [ADD] Import torchvision transforms
 
 
 class BidirectionalTrajectoryDataset(Dataset):
@@ -36,11 +37,10 @@ class BidirectionalTrajectoryDataset(Dataset):
         forward_steps: int = 16,
         backward_steps: int = 16,
         n_obs_steps: int = 1,
-        # 수정: 단일 이미지 키 대신 이미지 키 목록 사용
         image_keys: List[str] = ["observation.image"],
         state_key: str = "observation.state",
-        # [MODIFIED] Accept tasks mapping
-        tasks: Optional[Dict[int, str]] = None
+        tasks: Optional[Dict[int, str]] = None,
+        is_train: bool = False  # [MODIFIED] Add is_train flag
     ):
         """
         양방향 데이터셋을 초기화합니다.
@@ -62,6 +62,23 @@ class BidirectionalTrajectoryDataset(Dataset):
         self.image_keys = image_keys
         self.state_key = state_key
         self.tasks = tasks  # [MODIFIED] Store tasks mapping
+        self.is_train = is_train
+
+        # [MODIFIED] Define augmentation pipelines
+        if self.is_train:
+            # Common resize transform for both cameras
+            self.resize = T.Resize((224, 224), antialias=True)
+
+            # Augmentations for the main camera (front view)
+            self.main_camera_aug = T.Compose([
+                T.RandomCrop(size=(224, 224), padding=int(
+                    224 * 0.05), padding_mode='edge'),  # Pad and crop
+                T.RandomRotation(degrees=5),
+                T.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5)
+            ])
+            # Augmentations for the wrist camera (only color jitter)
+            self.wrist_camera_aug = T.ColorJitter(
+                brightness=0.3, contrast=0.4, saturation=0.5)
 
         # Create valid trajectory samples
         self.samples = self._create_samples()
@@ -180,7 +197,6 @@ class BidirectionalTrajectoryDataset(Dataset):
         # --- 초기 이미지와 상태(시간적 이력) ---
         # --- Initial image(s) and state(s) (temporal history) ---
         if self.n_obs_steps > 1:
-            # 시간적 시퀀스: start_idx_forward_segment로 끝나는 n_obs_steps 관측값 수집
             initial_images = []
             initial_states = []
 
@@ -199,12 +215,21 @@ class BidirectionalTrajectoryDataset(Dataset):
 
                 obs_data = self.lerobot_dataset[obs_idx]
 
-                # Load images from all keys and stack them on a new dimension
-                # This creates a (num_cameras, C, H, W) tensor, e.g., (2, 3, 224, 224)
-                stacked_image = torch.stack(
-                    [torch.as_tensor(obs_data[key], dtype=torch.float32)
-                     for key in self.image_keys]
-                )
+                # Load images as tensors
+                front_img = torch.as_tensor(
+                    obs_data[self.image_keys[0]], dtype=torch.float32)
+                wrist_img = torch.as_tensor(
+                    obs_data[self.image_keys[1]], dtype=torch.float32)
+
+                if self.is_train:
+                    # First, resize both to a consistent size
+                    front_img = self.resize(front_img)
+                    wrist_img = self.resize(wrist_img)
+                    # Then, apply specific augmentations
+                    front_img = self.main_camera_aug(front_img)
+                    wrist_img = self.wrist_camera_aug(wrist_img)
+
+                stacked_image = torch.stack([front_img, wrist_img])
                 initial_images.append(stacked_image)
                 initial_states.append(torch.as_tensor(
                     obs_data[self.state_key], dtype=torch.float32))
@@ -217,9 +242,20 @@ class BidirectionalTrajectoryDataset(Dataset):
             # 단일 관측: 이전 버전과의 호환성
             initial_data_idx = sample_info['start_idx_forward_segment']
             initial_data = self.lerobot_dataset[initial_data_idx]
-            # 수정: 여러 이미지 키를 처리하는 메서드 사용
-            initial_images_tensor = self._get_combined_image(
-                initial_data).unsqueeze(0)
+
+            # Load images as tensors
+            front_img = torch.as_tensor(
+                initial_data[self.image_keys[0]], dtype=torch.float32)
+            wrist_img = torch.as_tensor(
+                initial_data[self.image_keys[1]], dtype=torch.float32)
+
+            # --- [MODIFIED] Apply augmentations only during training ---
+            if self.is_train:
+                front_img = self.main_camera_aug(front_img)
+                wrist_img = self.wrist_camera_aug(wrist_img)
+
+            stacked_image = torch.stack([front_img, wrist_img])
+            initial_images_tensor = stacked_image.unsqueeze(0)
             initial_states_tensor = torch.as_tensor(
                 initial_data[self.state_key], dtype=torch.float32).unsqueeze(0)
 
@@ -251,10 +287,19 @@ class BidirectionalTrajectoryDataset(Dataset):
         # --- Goal image loading ---
         episode_end_data_idx = sample_info['episode_true_end_idx']
         episode_end_data = self.lerobot_dataset[episode_end_data_idx]
-        goal_image_tensor = torch.stack(
-            [torch.as_tensor(episode_end_data[key], dtype=torch.float32)
-             for key in self.image_keys]
-        )  # Shape: (num_cameras, 3, H, W)
+
+        goal_front_img = torch.as_tensor(
+            episode_end_data[self.image_keys[0]], dtype=torch.float32)
+        goal_wrist_img = torch.as_tensor(
+            episode_end_data[self.image_keys[1]], dtype=torch.float32)
+
+        if self.is_train:
+            goal_front_img = self.resize(goal_front_img)
+            goal_wrist_img = self.resize(goal_wrist_img)
+            goal_front_img = self.main_camera_aug(goal_front_img)
+            goal_wrist_img = self.wrist_camera_aug(goal_wrist_img)
+
+        goal_image_tensor = torch.stack([goal_front_img, goal_wrist_img])
         true_episode_end_state = torch.as_tensor(
             episode_end_data[self.state_key], dtype=torch.float32)
 

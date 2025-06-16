@@ -32,22 +32,21 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
         'progress_loss': 0.5
     }
 
-    # [MODIFIED] Calculate loss for both front and wrist goal images
-    if 'predicted_goal_image_front' in predictions and 'goal_images' in targets:
-        pred_front = predictions['predicted_goal_image_front']
-        pred_wrist = predictions['predicted_goal_image_wrist']
-        true_front = targets['goal_images'][:, 0]
-        true_wrist = targets['goal_images'][:, 1]
-        loss_front = F.mse_loss(pred_front, true_front)
-        loss_wrist = F.mse_loss(pred_wrist, true_wrist)
-        losses['goal_image_loss'] = loss_front + loss_wrist
+    if 'predicted_goal_images' in predictions and 'goal_images' in targets:
+        pred_img = predictions['predicted_goal_images']
+        true_img_front = targets['goal_images'][:, 0]
+        if pred_img.shape[2:] != true_img_front.shape[2:]:
+            true_img_front = F.interpolate(
+                true_img_front, size=pred_img.shape[2:], mode='bilinear', align_corners=False)
+        losses['goal_image_loss'] = F.mse_loss(pred_img, true_img_front)
 
+    # [FIXED] Changed state prediction loss back to L1 for robustness
     if 'predicted_forward_states' in predictions and 'forward_states' in targets:
-        losses['forward_state_loss'] = F.mse_loss(
+        losses['forward_state_loss'] = F.l1_loss(
             predictions['predicted_forward_states'], targets['forward_states'])
 
     if 'predicted_backward_states' in predictions and 'backward_states' in targets:
-        losses['backward_state_loss'] = F.mse_loss(
+        losses['backward_state_loss'] = F.l1_loss(
             predictions['predicted_backward_states'], targets['backward_states'])
 
     if 'predicted_progress' in predictions and 'normalized_timestep' in targets:
@@ -76,13 +75,9 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         self.image_encoder = ImageEncoder(v_cfg)
         self.language_encoder = LanguageEncoder(l_cfg)
         self.image_decoder = ImageDecoder(v_cfg)
-
-        for param in self.image_encoder.vit.parameters():
-            param.requires_grad = False
-        print("Froze ImageEncoder (ViT) backbone.")
-
         self.state_projection = nn.Linear(h_cfg.state_dim, h_cfg.hidden_dim)
         self.lang_projection = nn.Linear(l_cfg.embedding_dim, h_cfg.hidden_dim)
+
         vit_hidden_size = self.image_encoder.vit.config.hidden_size
         self.patch_token_projector = nn.Linear(
             vit_hidden_size, h_cfg.hidden_dim)
@@ -96,10 +91,12 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         self.fwd_query = nn.Parameter(torch.randn(
             1, h_cfg.forward_steps, h_cfg.hidden_dim))
 
+        # [FIXED] Corrected calculation for num_image_tokens
         num_lang_tokens = 1
         num_state_tokens = d_cfg.n_obs_steps
         num_image_tokens = d_cfg.n_obs_steps * \
-            (v_cfg.num_query_per_image * len(d_cfg.image_keys) + 2)
+            (v_cfg.num_query_per_image *
+             len(d_cfg.image_keys) + 2)  # Patches + 2 CLS tokens
         num_query_tokens = 1 + h_cfg.num_goal_tokens + \
             h_cfg.backward_steps + h_cfg.forward_steps
         max_len = num_lang_tokens + num_state_tokens + \
@@ -110,35 +107,27 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         decoder_layer = CustomDecoderLayer(
             d_model=h_cfg.hidden_dim, nhead=h_cfg.num_heads,
             dim_feedforward=h_cfg.hidden_dim * 4, dropout=h_cfg.dropout,
-            activation=F.gelu, batch_first=True
-        )
+            activation=F.gelu, batch_first=True)
         self.multi_modal_backbone = CustomDecoder(
-            decoder_layer, num_layers=h_cfg.num_layers, norm=RMSNorm(
-                h_cfg.hidden_dim)
-        )
+            decoder_layer, num_layers=h_cfg.num_layers, norm=RMSNorm(h_cfg.hidden_dim))
 
         mlp_hidden_dim = h_cfg.hidden_dim // 2
-        self.goal_head_front = nn.Linear(
-            h_cfg.hidden_dim, v_cfg.image_latent_dim)
-        self.goal_head_wrist = nn.Linear(
-            h_cfg.hidden_dim, v_cfg.image_latent_dim)
+        self.goal_head = nn.Linear(h_cfg.hidden_dim, v_cfg.image_latent_dim)
         self.bwd_head = nn.Sequential(
             nn.Linear(h_cfg.hidden_dim, mlp_hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(mlp_hidden_dim, h_cfg.state_dim)
-        )
+            nn.Linear(mlp_hidden_dim, h_cfg.state_dim))
         self.fwd_head = nn.Sequential(
             nn.Linear(h_cfg.hidden_dim, mlp_hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(mlp_hidden_dim, h_cfg.state_dim)
-        )
+            nn.Linear(mlp_hidden_dim, h_cfg.state_dim))
         self.progress_head = nn.Linear(h_cfg.hidden_dim, 1)
 
     def forward(self, initial_images, initial_states, language_instruction, **kwargs):
-        batch_size = initial_images.shape[0]
-        n_obs_steps = initial_images.shape[1]
+        batch_size, n_obs_steps = initial_images.shape[:2]
         h_cfg = self.config.hierarchical_transformer
 
+        # 1. Input Embedding
         images_flat = initial_images.flatten(0, 1)
         front_images, wrist_images = images_flat[:, 0], images_flat[:, 1]
         front_patch_tokens, front_cls = self.image_encoder(front_images)
@@ -156,6 +145,7 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         lang_embed = self.language_encoder(language_instruction).unsqueeze(1)
         lang_embed_proj = self.lang_projection(lang_embed)
 
+        # 2. Assemble Full Sequence
         history_embeds = torch.cat(
             [lang_embed_proj, state_embeds, img_embeds], dim=1)
         query_embeds = torch.cat([
@@ -167,51 +157,51 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         seq = torch.cat([history_embeds, query_embeds], dim=1)
         seq = seq + self.pos_embed[:, :seq.shape[1], :]
 
+        # 3. Create Custom Attention Mask
+        seq_len = seq.shape[1]
+        custom_mask_bool = torch.ones(
+            seq_len, seq_len, device=seq.device, dtype=torch.bool).triu(1)
+
+        # [FIXED] Correct calculation order for start indices
         hist_len = history_embeds.size(1)
         prog_start = hist_len
         goal_start = prog_start + 1
         bwd_start = goal_start + h_cfg.num_goal_tokens
         fwd_start = bwd_start + h_cfg.backward_steps
 
-        # 3. Create Custom Attention Mask for the new hierarchy
-        seq_len = seq.shape[1]
-        custom_mask_bool = torch.ones(
-            seq_len, seq_len, device=seq.device, dtype=torch.bool).triu(1)
-
-        # [MODIFIED] Update mask logic for the new hierarchy
-        # All queries see history
+        # Apply mask logic with correct indices
         custom_mask_bool[prog_start:, :hist_len] = False
-        # Goal, Bwd, Fwd see Progress
         custom_mask_bool[goal_start:, prog_start:goal_start] = False
-        # Bwd, Fwd see Goal
         custom_mask_bool[bwd_start:, goal_start:bwd_start] = False
-        # Fwd sees Bwd
         custom_mask_bool[fwd_start:, bwd_start:fwd_start] = False
 
-        # 4. Run CustomDecoder Backbone
+        # 4. Run Backbone
         out = self.multi_modal_backbone(seq, mask=custom_mask_bool)
 
+        # 5. [FIXED] Slice outputs with correct indices
         prog_h = out[:, prog_start: goal_start].mean(dim=1)
         goal_h = out[:, goal_start: bwd_start].mean(dim=1)
         bwd_h_sequence = out[:, bwd_start: fwd_start]
-        fwd_h_sequence = out[:, fwd_start:]
+        fwd_h_sequence = out[:, fwd_start: fwd_start +
+                             h_cfg.forward_steps]  # Ensure correct length
 
+        # 6. Final Predictions
         pred_bwd_states = self.bwd_head(bwd_h_sequence)
         pred_fwd_states = self.fwd_head(fwd_h_sequence)
-        pred_latent_front = self.goal_head_front(goal_h)
-        pred_latent_wrist = self.goal_head_wrist(goal_h)
-        pred_img_front, pred_img_wrist = self.image_decoder(
-            pred_latent_front, pred_latent_wrist)
+
+        pred_latent = self.goal_head(goal_h)
+        pred_img = self.image_decoder(pred_latent)
+
+        predicted_progress = torch.sigmoid(self.progress_head(prog_h))
+
         preds = {
-            "predicted_backward_states": pred_bwd_states,
-            "predicted_forward_states": pred_fwd_states,
-            "predicted_goal_image_front": pred_img_front,
-            "predicted_goal_image_wrist": pred_img_wrist,
-            "predicted_progress": torch.sigmoid(self.progress_head(prog_h)),
+            "predicted_backward_states": pred_bwd_states,  # No .view() needed
+            "predicted_forward_states": pred_fwd_states,  # No .view() needed
+            "predicted_goal_images": pred_img,
+            "predicted_progress": predicted_progress,
         }
         return preds
 
     @torch.no_grad()
     def generate(self, initial_images, initial_states, language_instruction) -> Dict[str, torch.Tensor]:
-        # Generate now also produces progress, but it's mainly for loss calculation during training
         return self.forward(initial_images, initial_states, language_instruction)

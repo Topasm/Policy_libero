@@ -45,7 +45,7 @@ def _quat2axisangle(quat):
 class EvalConfig:
     # --- 필수 설정 ---
     planner_checkpoint_path: str = "outputs/train/bidirectional_transformero/model_final.pth"
-    invdyn_checkpoint_path: str = "outputs/train/invdyn_only/invdyn_final.pth"
+    invdyn_checkpoint_path: str = "outputs/train/invdyn_onlyl1loss/invdyn_final.pth"
 
     # --- LIBERO 벤치마크 설정 ---
     benchmark_name: str = "libero_object"
@@ -156,8 +156,8 @@ def main(cfg: EvalConfig):
                 control_freq=20,
                 # 전면, 손목 카메라 활성화
                 camera_names=["frontview", "robot0_eye_in_hand"],
-                camera_heights=224,  # 경고 메시지 방지를 위해 16의 배수로 수정
-                camera_widths=224
+                camera_heights=256,  # 경고 메시지 방지를 위해 16의 배수로 수정
+                camera_widths=256
             )
             # --- 여기까지 수정 ---
             env.seed(cfg.seed + trial_idx)

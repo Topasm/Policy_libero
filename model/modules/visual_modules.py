@@ -92,6 +92,9 @@ class ImageEncoder(nn.Module):
         self.vit = AutoModel.from_pretrained(cfg.vision_backbone)
         self.vit.config.image_size = cfg.image_size
 
+        for param in self.vit.parameters():
+            param.requires_grad = False
+
         self.resampler = PerceiverResampler(
             dim=self.vit.config.hidden_size,
             depth=2, num_latents=cfg.num_query_per_image, heads=8, dim_head=64,
@@ -172,15 +175,8 @@ class ImageDecoder(nn.Module):
                                kernel_size=4, stride=2, padding=1), nn.Sigmoid()
         )
 
-    # [MODIFIED] The forward method now accepts two latents and returns two images.
-    def forward(self, latent_front: torch.Tensor, latent_wrist: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """ Decodes two latent vectors into two separate images by reusing the same decoder weights. """
-        # Decode front image
-        x_front = self.initial_linear(latent_front).view(-1, 512, 4, 4)
-        pred_front = self.decoder(x_front)
-
-        # Decode wrist image
-        x_wrist = self.initial_linear(latent_wrist).view(-1, 512, 4, 4)
-        pred_wrist = self.decoder(x_wrist)
-
-        return pred_front, pred_wrist
+    # [MODIFIED] Reverted to single-latent-input, single-image-output structure.
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        """ Decodes a single latent vector into a single image. """
+        x = self.initial_linear(latents).view(-1, 512, 4, 4)
+        return self.decoder(x)

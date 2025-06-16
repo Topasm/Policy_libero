@@ -81,7 +81,8 @@ def main():
         image_keys=cfg.data.image_keys,
         state_key="observation.state",
         # [MODIFIED] Pass the tasks mapping to the dataset class.
-        tasks=tasks_mapping
+        tasks=tasks_mapping,
+        is_train=True
     )
 
     dataloader = DataLoader(
@@ -192,19 +193,20 @@ def main():
                 torch.save(model.state_dict(), ckpt_path)
                 tqdm.write(f"\nSaved checkpoint: {ckpt_path}")
 
-                # --- [MODIFIED] Image Logging Logic for both predicted views ---
-                pred_img_front = predictions['predicted_goal_image_front'][0].cpu().clamp(
-                    0, 1)
-                pred_img_wrist = predictions['predicted_goal_image_wrist'][0].cpu().clamp(
+                # --- [MODIFIED] Simplified Image Logging Logic ---
+                # The model predicts a single 3-channel image.
+                pred_img_front = predictions['predicted_goal_images'][0].cpu().clamp(
                     0, 1)
 
+                # Get the ground truth images for reference.
                 true_img_front = batch_device['goal_images'][0, 0].cpu()
                 true_img_wrist = batch_device['goal_images'][0, 1].cpu()
 
+                # Log only the predicted front view.
                 wandb.log({
                     "predictions/goal_image_front": wandb.Image(pred_img_front),
-                    "predictions/goal_image_wrist": wandb.Image(pred_img_wrist),
                     "ground_truth/goal_image_front": wandb.Image(true_img_front),
+                    # For reference
                     "ground_truth/goal_image_wrist": wandb.Image(true_img_wrist),
                     "step": step
                 })
