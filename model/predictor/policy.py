@@ -77,47 +77,31 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         self.language_encoder = LanguageEncoder(l_cfg)
         self.image_decoder = ImageDecoder(v_cfg)
 
-        # --- [MODIFIED] All projection logic is now cleanly defined here ---
+        for param in self.image_encoder.vit.parameters():
+            param.requires_grad = False
+        print("Froze ImageEncoder (ViT) backbone.")
 
-        # 1. State Projector (Unchanged)
         self.state_projection = nn.Linear(h_cfg.state_dim, h_cfg.hidden_dim)
-
-        # [MODIFIED] This layer now takes the raw embedding_dim from the language encoder
         self.lang_projection = nn.Linear(l_cfg.embedding_dim, h_cfg.hidden_dim)
-
-        # 3. Vision Projectors
-        # ViT's native hidden size (e.g., 768) to our model's hidden_dim
         vit_hidden_size = self.image_encoder.vit.config.hidden_size
         self.patch_token_projector = nn.Linear(
             vit_hidden_size, h_cfg.hidden_dim)
         self.cls_token_projector = nn.Linear(vit_hidden_size, h_cfg.hidden_dim)
 
-        # [MODIFIED] Add a separate projector for the [CLS] token
-        self.cls_token_projector = nn.Linear(768, h_cfg.hidden_dim)
-
-        # 기존 image_token_projector는 이제 패치 토큰 전용입니다.
-        if v_cfg.image_latent_dim != h_cfg.hidden_dim:
-            self.image_token_projector = nn.Linear(
-                v_cfg.image_latent_dim, h_cfg.hidden_dim)
-        else:
-            self.image_token_projector = nn.Identity()
-
-        # [MODIFIED] Add a new query token for progress prediction
         self.progress_query = nn.Parameter(torch.randn(1, 1, h_cfg.hidden_dim))
         self.goal_query = nn.Parameter(torch.randn(
             1, h_cfg.num_goal_tokens, h_cfg.hidden_dim))
         self.bwd_query = nn.Parameter(torch.randn(
-            1, h_cfg.num_bwd_tokens, h_cfg.hidden_dim))
+            1, h_cfg.backward_steps, h_cfg.hidden_dim))
         self.fwd_query = nn.Parameter(torch.randn(
-            1, h_cfg.num_fwd_tokens, h_cfg.hidden_dim))
+            1, h_cfg.forward_steps, h_cfg.hidden_dim))
 
-        # [MODIFIED] Update max sequence length calculation for the new query
         num_lang_tokens = 1
         num_state_tokens = d_cfg.n_obs_steps
         num_image_tokens = d_cfg.n_obs_steps * \
-            v_cfg.num_query_per_image * len(d_cfg.image_keys)
+            (v_cfg.num_query_per_image * len(d_cfg.image_keys) + 2)
         num_query_tokens = 1 + h_cfg.num_goal_tokens + \
-            h_cfg.num_bwd_tokens + h_cfg.num_fwd_tokens  # Now 4 queries
+            h_cfg.backward_steps + h_cfg.forward_steps
         max_len = num_lang_tokens + num_state_tokens + \
             num_image_tokens + num_query_tokens + 16
         self.pos_embed = nn.Parameter(
@@ -133,15 +117,21 @@ class HierarchicalAutoregressivePolicy(nn.Module):
                 h_cfg.hidden_dim)
         )
 
-        # [MODIFIED] Create two separate prediction heads for goal latents
+        mlp_hidden_dim = h_cfg.hidden_dim // 2
         self.goal_head_front = nn.Linear(
             h_cfg.hidden_dim, v_cfg.image_latent_dim)
         self.goal_head_wrist = nn.Linear(
             h_cfg.hidden_dim, v_cfg.image_latent_dim)
-        self.bwd_head = nn.Linear(
-            h_cfg.hidden_dim, h_cfg.backward_steps * h_cfg.state_dim)
-        self.fwd_head = nn.Linear(
-            h_cfg.hidden_dim, h_cfg.forward_steps * h_cfg.state_dim)
+        self.bwd_head = nn.Sequential(
+            nn.Linear(h_cfg.hidden_dim, mlp_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(mlp_hidden_dim, h_cfg.state_dim)
+        )
+        self.fwd_head = nn.Sequential(
+            nn.Linear(h_cfg.hidden_dim, mlp_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(mlp_hidden_dim, h_cfg.state_dim)
+        )
         self.progress_head = nn.Linear(h_cfg.hidden_dim, 1)
 
     def forward(self, initial_images, initial_states, language_instruction, **kwargs):
@@ -149,22 +139,14 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         n_obs_steps = initial_images.shape[1]
         h_cfg = self.config.hierarchical_transformer
 
-        # 1. Input Embedding
-        # --- Vision processing to handle both patch and CLS tokens ---
         images_flat = initial_images.flatten(0, 1)
         front_images, wrist_images = images_flat[:, 0], images_flat[:, 1]
-
-        # ImageEncoder now returns raw-dimension tokens
         front_patch_tokens, front_cls = self.image_encoder(front_images)
         wrist_patch_tokens, wrist_cls = self.image_encoder(wrist_images)
-
-        # [MODIFIED] Projection is now done here, in the main policy model.
         front_patch_embeds = self.patch_token_projector(front_patch_tokens)
         wrist_patch_embeds = self.patch_token_projector(wrist_patch_tokens)
         front_cls_embed = self.cls_token_projector(front_cls)
         wrist_cls_embed = self.cls_token_projector(wrist_cls)
-
-        # Concatenate all visual embeddings
         image_tokens = torch.cat(
             [front_patch_embeds, wrist_patch_embeds, front_cls_embed, wrist_cls_embed], dim=1)
         img_embeds = image_tokens.view(
@@ -174,32 +156,27 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         lang_embed = self.language_encoder(language_instruction).unsqueeze(1)
         lang_embed_proj = self.lang_projection(lang_embed)
 
-        # 2. Assemble Full Sequence (History + Queries)
         history_embeds = torch.cat(
             [lang_embed_proj, state_embeds, img_embeds], dim=1)
-
-        # [MODIFIED] Add progress_query to the sequence, before the goal_query
         query_embeds = torch.cat([
             self.progress_query.expand(batch_size, -1, -1),
             self.goal_query.expand(batch_size, -1, -1),
             self.bwd_query.expand(batch_size, -1, -1),
             self.fwd_query.expand(batch_size, -1, -1)
         ], dim=1)
-
         seq = torch.cat([history_embeds, query_embeds], dim=1)
         seq = seq + self.pos_embed[:, :seq.shape[1], :]
+
+        hist_len = history_embeds.size(1)
+        prog_start = hist_len
+        goal_start = prog_start + 1
+        bwd_start = goal_start + h_cfg.num_goal_tokens
+        fwd_start = bwd_start + h_cfg.backward_steps
 
         # 3. Create Custom Attention Mask for the new hierarchy
         seq_len = seq.shape[1]
         custom_mask_bool = torch.ones(
             seq_len, seq_len, device=seq.device, dtype=torch.bool).triu(1)
-
-        hist_len = history_embeds.size(1)
-        # Define start indices for all queries
-        prog_start = hist_len
-        goal_start = prog_start + 1  # num_progress_tokens is 1
-        bwd_start = goal_start + h_cfg.num_goal_tokens
-        fwd_start = bwd_start + h_cfg.num_bwd_tokens
 
         # [MODIFIED] Update mask logic for the new hierarchy
         # All queries see history
@@ -214,22 +191,20 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         # 4. Run CustomDecoder Backbone
         out = self.multi_modal_backbone(seq, mask=custom_mask_bool)
 
-        # 5. Slice outputs and make final predictions
-        prog_h = out[:, prog_start: prog_start + 1].mean(dim=1)
-        goal_h = out[:, goal_start: goal_start +
-                     h_cfg.num_goal_tokens].mean(dim=1)
-        bwd_h = out[:, bwd_start: bwd_start + h_cfg.num_bwd_tokens].mean(dim=1)
-        fwd_h = out[:, fwd_start: fwd_start + h_cfg.num_fwd_tokens].mean(dim=1)
+        prog_h = out[:, prog_start: goal_start].mean(dim=1)
+        goal_h = out[:, goal_start: bwd_start].mean(dim=1)
+        bwd_h_sequence = out[:, bwd_start: fwd_start]
+        fwd_h_sequence = out[:, fwd_start:]
 
-        # [MODIFIED] Predict two separate latents and decode them into two images
+        pred_bwd_states = self.bwd_head(bwd_h_sequence)
+        pred_fwd_states = self.fwd_head(fwd_h_sequence)
         pred_latent_front = self.goal_head_front(goal_h)
         pred_latent_wrist = self.goal_head_wrist(goal_h)
         pred_img_front, pred_img_wrist = self.image_decoder(
             pred_latent_front, pred_latent_wrist)
-
         preds = {
-            "predicted_backward_states": self.bwd_head(bwd_h).view(-1, h_cfg.backward_steps, h_cfg.state_dim),
-            "predicted_forward_states": self.fwd_head(fwd_h).view(-1, h_cfg.forward_steps, h_cfg.state_dim),
+            "predicted_backward_states": pred_bwd_states,
+            "predicted_forward_states": pred_fwd_states,
             "predicted_goal_image_front": pred_img_front,
             "predicted_goal_image_wrist": pred_img_wrist,
             "predicted_progress": torch.sigmoid(self.progress_head(prog_h)),

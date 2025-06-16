@@ -88,7 +88,7 @@ class ImageEncoder(nn.Module):
         self.cfg = cfg
         # [MODIFIED] Load the processor associated with the vision backbone
         self.processor = AutoImageProcessor.from_pretrained(
-            cfg.vision_backbone)
+            cfg.vision_backbone, use_fast=True)
         self.vit = AutoModel.from_pretrained(cfg.vision_backbone)
         self.vit.config.image_size = cfg.image_size
 
@@ -105,7 +105,8 @@ class ImageEncoder(nn.Module):
         # The processor handles resizing and normalization (mean/std standardization).
         # It expects a list of images or a batched tensor.
         # It returns a dict with 'pixel_values'.
-        inputs = self.processor(images=image_tensor_3ch, return_tensors="pt")
+        inputs = self.processor(images=image_tensor_3ch,
+                                return_tensors="pt", do_rescale=False)
 
         # Move the processed tensor to the correct device
         processed_images = inputs['pixel_values'].to(image_tensor_3ch.device)
