@@ -8,7 +8,7 @@ from einops import rearrange, repeat
 from open_clip import create_model_from_pretrained, get_tokenizer
 
 from config.config import VisionEncoderConfig, LanguageEncoderConfig
-from transformers import AutoModel
+from transformers import AutoModel, AutoTokenizer, CLIPTextModel, AutoImageProcessor
 
 
 def exists(val):
@@ -86,6 +86,9 @@ class ImageEncoder(nn.Module):
     def __init__(self, cfg: VisionEncoderConfig):
         super().__init__()
         self.cfg = cfg
+        # [MODIFIED] Load the processor associated with the vision backbone
+        self.processor = AutoImageProcessor.from_pretrained(
+            cfg.vision_backbone)
         self.vit = AutoModel.from_pretrained(cfg.vision_backbone)
         self.vit.config.image_size = cfg.image_size
 
@@ -93,67 +96,57 @@ class ImageEncoder(nn.Module):
             dim=self.vit.config.hidden_size,
             depth=2, num_latents=cfg.num_query_per_image, heads=8, dim_head=64,
         )
-        # Patch token projection only
-        self.patch_token_projection = nn.Linear(
-            self.vit.config.hidden_size, cfg.image_latent_dim)
+        # projection layers removed
 
     def forward(self, image_tensor_3ch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        [MODIFIED] Returns both resampled patch tokens and the original [CLS] token.
+        [MODIFIED] Now returns raw features from ViT and Resampler without projection.
         """
-        resized_images = TF.resize(
-            image_tensor_3ch, [self.cfg.image_size, self.cfg.image_size], antialias=True)
+        # The processor handles resizing and normalization (mean/std standardization).
+        # It expects a list of images or a batched tensor.
+        # It returns a dict with 'pixel_values'.
+        inputs = self.processor(images=image_tensor_3ch, return_tensors="pt")
 
-        all_tokens = self.vit(pixel_values=resized_images).last_hidden_state
-        cls_token = all_tokens[:, :1, :]      # Shape: (B, 1, hidden)
-        patch_tokens = all_tokens[:, 1:, :]   # Shape: (B, N, hidden)
+        # Move the processed tensor to the correct device
+        processed_images = inputs['pixel_values'].to(image_tensor_3ch.device)
 
-        resampled_patch_tokens = self.resampler(patch_tokens)
-        projected_patch_tokens = self.patch_token_projection(
-            resampled_patch_tokens)
+        # Pass the correctly preprocessed images to the ViT
+        all_tokens = self.vit(pixel_values=processed_images).last_hidden_state
 
-        return projected_patch_tokens, cls_token  # Return both types of tokens
+        cls_token = all_tokens[:, :1, :]
+        patch_tokens = all_tokens[:, 1:, :]
+
+        # Resample patch tokens but do not project them yet.
+        resampled_patch_tokens = self.resampler(
+            patch_tokens)  # Shape: (B, num_latents, 768)
+
+        return resampled_patch_tokens, cls_token  # Return both types of tokens
 
 
 # --- [MODIFIED] Rewritten LanguageEncoder using open_clip ---
 class LanguageEncoder(nn.Module):
     def __init__(self, cfg: LanguageEncoderConfig):
         super().__init__()
-        # [FIX] Use model_name for model, pretrained for weights, and model_name for tokenizer
-        try:
-            self.model, _ = create_model_from_pretrained(
-                model_name=cfg.model_name, pretrained=cfg.pretrained
-            )
-        except Exception as e:
-            print(
-                f"Error loading model with model_name='{cfg.model_name}', pretrained='{cfg.pretrained}'. Check available models in open_clip."
-            )
-            raise e
-
-        # [FIX] Use model_name for tokenizer to avoid tokenizer mismatch
+        # Load model and tokenizer from open_clip
+        self.model, _ = create_model_from_pretrained(
+            model_name=cfg.model_name,
+            pretrained=cfg.pretrained
+        )
         self.tokenizer = get_tokenizer(cfg.model_name)
 
+        # Freeze the model
         for param in self.model.parameters():
             param.requires_grad = False
 
-        if cfg.embedding_dim != cfg.projection_dim:
-            self.projection = nn.Linear(cfg.embedding_dim, cfg.projection_dim)
-            self._proj_device = lambda: self.projection.weight.device
-            self._proj_dtype = lambda: self.projection.weight.dtype
-        else:
-            self.projection = nn.Identity()
-            self._proj_device = lambda: next(self.model.parameters()).device
-            self._proj_dtype = lambda: next(self.model.parameters()).dtype
-
     def forward(self, texts):
-        device = self._proj_device()
-        dtype = self._proj_dtype()
-        self.model.to(device)
+        # Move model to the correct device
+        device = next(self.model.parameters()).device
 
         text_tokens = self.tokenizer(texts).to(device)
         text_features = self.model.encode_text(text_tokens)
-        text_features = text_features.to(dtype)
-        return self.projection(text_features)
+
+        # Return the raw features from the encoder
+        return text_features.to(torch.float32)
 
 
 class ImageDecoder(nn.Module):

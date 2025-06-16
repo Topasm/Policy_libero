@@ -44,12 +44,12 @@ def _quat2axisangle(quat):
 @dataclass
 class EvalConfig:
     # --- 필수 설정 ---
-    planner_checkpoint_path: str = "outputs/train/bidirectional_transformerf/model_final.pth"
+    planner_checkpoint_path: str = "outputs/train/bidirectional_transformero/model_final.pth"
     invdyn_checkpoint_path: str = "outputs/train/invdyn_only/invdyn_final.pth"
 
     # --- LIBERO 벤치마크 설정 ---
-    benchmark_name: str = "libero_goal"
-    task_order_index: int = 0  # 사용할 태스크 순서 인덱스
+    benchmark_name: str = "libero_object"
+    task_order_index: int = 4  # 사용할 태스크 순서 인덱스
 
     # --- 평가 관련 설정 ---
     num_trials_per_task: int = 10
@@ -59,8 +59,8 @@ class EvalConfig:
     output_dir: str = "outputs/eval/libero_benchmark"
 
     # [MODIFIED] Added parameters for stabilization and replanning
-    num_steps_wait: int = 10
-    replan_steps: int = 5
+    num_steps_wait: int = 5
+    replan_steps: int = 4
 
 
 @draccus.wrap()
@@ -203,25 +203,18 @@ def run_episode(policy, env, task_description, initial_state, device, cfg: EvalC
     action_plan = deque()
 
     obs, _, _, _ = env.step(np.zeros(7))
-    frames = []
+
+    # Start recording frames immediately
+    concatenated_frame = np.concatenate(
+        [obs["frontview_image"], obs["robot0_eye_in_hand_image"]], axis=1)
+    frames = [np.flip(concatenated_frame, axis=0)]
 
     max_steps = env.env.horizon
     t = 0
 
-    while t < max_steps-1:
-        # 1. Wait for simulation to stabilize
-        if t < cfg.num_steps_wait:
-            obs, _, terminated, info = env.step(np.zeros(7))
-            if t == cfg.num_steps_wait - 1:
-                # Start recording frames after waiting
-                concatenated_frame = np.concatenate(
-                    [obs["frontview_image"], obs["robot0_eye_in_hand_image"]], axis=1)
-                frames.append(np.flip(concatenated_frame, axis=0))
-            t += 1
-            continue
-
-        # 2. Check if we need to replan (every replan_steps)
-        if (t - cfg.num_steps_wait) % cfg.replan_steps == 0:
+    while t < max_steps - 1:
+        # Check if we need to replan (every replan_steps)
+        if t % cfg.replan_steps == 0:
             # Construct observation dict for the policy
             state_np = np.concatenate([obs["robot0_eef_pos"], _quat2axisangle(
                 obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]])
@@ -245,9 +238,9 @@ def run_episode(policy, env, task_description, initial_state, device, cfg: EvalC
             action_chunk = policy.plan_actions(observation_dict)
             action_plan.extend(action_chunk)
 
-        # 3. Get the next action from the plan
+        # Get the next action from the plan
         if not action_plan:
-            # If plan is empty (e.g., not enough history yet), take a dummy action
+            # If plan is empty, take a dummy action
             action = np.zeros(7)
             action[-1] = -1  # Gripper open
         else:

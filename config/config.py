@@ -29,15 +29,13 @@ class LanguageEncoderConfig:
     pretrained: str = "webli"
     # ViT-Small has an embedding dimension of 384
     embedding_dim: int = 768
-    # Project to the main transformer's hidden dimension (which is also 384)
-    projection_dim: int = 384
 
 
 @dataclass
 class HierarchicalTransformerConfig:
     """[MODIFIED] Configuration for the Hierarchical Autoregressive Transformer policy, inspired by Seer."""
     state_dim: int = 8  # Dynamically set from data
-    hidden_dim: int = 384
+    hidden_dim: int = 512
     num_layers: int = 12
     num_heads: int = 12    # Seer uses 12
     dropout: float = 0.1
@@ -97,7 +95,7 @@ class DataConfig:
 @dataclass
 class TrainingConfig:
     """[MODIFIED] Configuration for training, inspired by Seer."""
-    training_steps: int = 5000  # A more realistic number of steps
+    training_steps: int = 50000  # A more realistic number of steps
     batch_size: int = 64      # Seer uses a large batch size for finetuning
     # Seer uses 1e-3 for FT, but 1e-4 is a safer starting point for pre-training
     learning_rate: float = 1e-4

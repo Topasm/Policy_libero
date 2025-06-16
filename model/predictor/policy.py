@@ -43,11 +43,11 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
         losses['goal_image_loss'] = loss_front + loss_wrist
 
     if 'predicted_forward_states' in predictions and 'forward_states' in targets:
-        losses['forward_state_loss'] = F.l1_loss(
+        losses['forward_state_loss'] = F.mse_loss(
             predictions['predicted_forward_states'], targets['forward_states'])
 
     if 'predicted_backward_states' in predictions and 'backward_states' in targets:
-        losses['backward_state_loss'] = F.l1_loss(
+        losses['backward_state_loss'] = F.mse_loss(
             predictions['predicted_backward_states'], targets['backward_states'])
 
     if 'predicted_progress' in predictions and 'normalized_timestep' in targets:
@@ -76,9 +76,21 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         self.image_encoder = ImageEncoder(v_cfg)
         self.language_encoder = LanguageEncoder(l_cfg)
         self.image_decoder = ImageDecoder(v_cfg)
+
+        # --- [MODIFIED] All projection logic is now cleanly defined here ---
+
+        # 1. State Projector (Unchanged)
         self.state_projection = nn.Linear(h_cfg.state_dim, h_cfg.hidden_dim)
-        self.lang_projection = nn.Linear(
-            l_cfg.projection_dim, h_cfg.hidden_dim)
+
+        # [MODIFIED] This layer now takes the raw embedding_dim from the language encoder
+        self.lang_projection = nn.Linear(l_cfg.embedding_dim, h_cfg.hidden_dim)
+
+        # 3. Vision Projectors
+        # ViT's native hidden size (e.g., 768) to our model's hidden_dim
+        vit_hidden_size = self.image_encoder.vit.config.hidden_size
+        self.patch_token_projector = nn.Linear(
+            vit_hidden_size, h_cfg.hidden_dim)
+        self.cls_token_projector = nn.Linear(vit_hidden_size, h_cfg.hidden_dim)
 
         # [MODIFIED] Add a separate projector for the [CLS] token
         self.cls_token_projector = nn.Linear(768, h_cfg.hidden_dim)
@@ -138,23 +150,23 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         h_cfg = self.config.hierarchical_transformer
 
         # 1. Input Embedding
-        # --- [MODIFIED] Vision processing to handle both patch and CLS tokens ---
+        # --- Vision processing to handle both patch and CLS tokens ---
         images_flat = initial_images.flatten(0, 1)
         front_images, wrist_images = images_flat[:, 0], images_flat[:, 1]
 
-        # ImageEncoder가 이제 두 종류의 토큰을 반환합니다.
+        # ImageEncoder now returns raw-dimension tokens
         front_patch_tokens, front_cls = self.image_encoder(front_images)
         wrist_patch_tokens, wrist_cls = self.image_encoder(wrist_images)
 
-        # 각 토큰 종류에 맞는 프로젝터를 적용합니다.
-        front_patch_tokens = self.image_token_projector(front_patch_tokens)
-        wrist_patch_tokens = self.image_token_projector(wrist_patch_tokens)
+        # [MODIFIED] Projection is now done here, in the main policy model.
+        front_patch_embeds = self.patch_token_projector(front_patch_tokens)
+        wrist_patch_embeds = self.patch_token_projector(wrist_patch_tokens)
         front_cls_embed = self.cls_token_projector(front_cls)
         wrist_cls_embed = self.cls_token_projector(wrist_cls)
 
-        # 모든 시각 토큰들을 결합합니다.
+        # Concatenate all visual embeddings
         image_tokens = torch.cat(
-            [front_patch_tokens, wrist_patch_tokens, front_cls_embed, wrist_cls_embed], dim=1)
+            [front_patch_embeds, wrist_patch_embeds, front_cls_embed, wrist_cls_embed], dim=1)
         img_embeds = image_tokens.view(
             batch_size, n_obs_steps * image_tokens.shape[1], -1)
 

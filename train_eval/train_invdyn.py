@@ -48,7 +48,7 @@ def compute_loss(batch: dict[str, Tensor], model: MlpInvDynamic, cfg: PolicyConf
 
 
 def main():
-    output_directory = Path("outputs/train/invdyn_only")
+    output_directory = Path("outputs/train/invdyn_onlyl1loss")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
