@@ -22,13 +22,11 @@ class VisionEncoderConfig:
 
 @dataclass
 class LanguageEncoderConfig:
-    """[MODIFIED] Configuration for the open_clip language encoder."""
-    # The base architecture name known to the open_clip library
-    model_name: str = "ViT-B-16-SigLIP2"
-    # The Hugging Face Hub repository ID where the weights are stored
-    pretrained: str = "webli"
-    # ViT-Small has an embedding dimension of 384
-    embedding_dim: int = 768
+    """[MODIFIED] Reverted to standard CLIP configuration."""
+
+    model_name: str = "ViT-B/32"
+
+    embedding_dim: int = 512
 
 
 @dataclass

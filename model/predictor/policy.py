@@ -108,9 +108,6 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         self.language_encoder = LanguageEncoder(l_cfg)
         self.image_decoder = ImageDecoder(v_cfg)
 
-        for param in self.image_encoder.vit.parameters():
-            param.requires_grad = False
-
         # --- Projectors ---
         self.state_projection = nn.Linear(h_cfg.state_dim, h_cfg.hidden_dim)
         self.lang_projection = nn.Linear(l_cfg.embedding_dim, h_cfg.hidden_dim)

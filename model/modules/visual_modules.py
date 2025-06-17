@@ -4,8 +4,7 @@ import torch.nn as nn
 import torchvision.transforms.functional as TF
 from einops import rearrange, repeat
 
-# [MODIFIED] Import from open_clip instead of transformers
-from open_clip import create_model_from_pretrained, get_tokenizer
+import clip
 
 from config.config import VisionEncoderConfig, LanguageEncoderConfig
 from transformers import AutoModel, AutoTokenizer, CLIPTextModel, AutoImageProcessor
@@ -127,28 +126,26 @@ class ImageEncoder(nn.Module):
         return resampled_patch_tokens, cls_token  # Return both types of tokens
 
 
-# --- [MODIFIED] Rewritten LanguageEncoder using open_clip ---
+# --- [MODIFIED] Simplified LanguageEncoder to only extract features ---
 class LanguageEncoder(nn.Module):
     def __init__(self, cfg: LanguageEncoderConfig):
         super().__init__()
-        # Load model and tokenizer from open_clip
-        self.model, _ = create_model_from_pretrained(
-            model_name=cfg.model_name,
-            pretrained=cfg.pretrained
-        )
-        self.tokenizer = get_tokenizer(cfg.model_name)
-
-        # Freeze the model
+        # [MODIFIED] Using original OpenAI CLIP library
+        try:
+            self.model, _ = clip.load(cfg.model_name)
+        except Exception as e:
+            print(
+                f"Error loading CLIP model '{cfg.model_name}'. Make sure you have run 'pip install git+https://github.com/openai/CLIP.git'")
+            raise e
+        # [REMOVED] The projection layer is no longer part of this module.
         for param in self.model.parameters():
             param.requires_grad = False
 
     def forward(self, texts):
-        # Move model to the correct device
+
         device = next(self.model.parameters()).device
-
-        text_tokens = self.tokenizer(texts).to(device)
+        text_tokens = clip.tokenize(texts).to(device)
         text_features = self.model.encode_text(text_tokens)
-
         # Return the raw features from the encoder
         return text_features.to(torch.float32)
 
