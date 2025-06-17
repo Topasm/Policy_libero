@@ -2,7 +2,6 @@
 
 from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from model.modeling_bidirectional_rtdiffusion import HierarchicalPolicy
 from model.invdyn.invdyn import MlpInvDynamic
 from config.config import PolicyConfig
 from model.predictor.policy import HierarchicalAutoregressivePolicy
@@ -44,8 +43,7 @@ def _quat2axisangle(quat):
 @dataclass
 class EvalConfig:
     # --- 필수 설정 ---
-    planner_checkpoint_path: str = "outputs/train/bidirectional_transformero/model_final.pth"
-    invdyn_checkpoint_path: str = "outputs/train/invdyn_onlyl1loss/invdyn_final.pth"
+    planner_checkpoint_path: str = "outputs/train/bidirectional_transformer/model_final.pth"
 
     # --- LIBERO 벤치마크 설정 ---
     benchmark_name: str = "libero_object"
@@ -86,37 +84,15 @@ def main(cfg: EvalConfig):
     features = dataset_to_policy_features(metadata.features)
 
     # a. 계획 모델 (Planner) 로딩
-    planner_model = HierarchicalAutoregressivePolicy(config=policy_cfg)
-    planner_model.load_state_dict(torch.load(
-        planner_checkpoint_path, map_location=device))
-    planner_model.to(device).eval()
-    print(f"Planner model loaded from: {cfg.planner_checkpoint_path}")
-
-    # b. 행동 모델 (Controller / Inverse Dynamics) 로딩
-    invdyn_model = MlpInvDynamic(
-        o_dim=policy_cfg.hierarchical_transformer.state_dim,
-        a_dim=features["action"].shape[0],
-        hidden_dim=policy_cfg.inverse_dynamics.hidden_dim,
-    )
-    invdyn_model.load_state_dict(torch.load(
-        cfg.invdyn_checkpoint_path, map_location=device))
-    invdyn_model.to(device).eval()
-    print(f"Inverse dynamics model loaded from: {cfg.invdyn_checkpoint_path}")
-
-    # c. 통합 정책 파이프라인 생성
-    combined_policy = HierarchicalPolicy(
-        bidirectional_transformer=planner_model,
-        inverse_dynamics_model=invdyn_model,
+    policy = HierarchicalAutoregressivePolicy(
+        config=policy_cfg,
         dataset_stats=metadata.stats,
-        all_dataset_features=metadata.features,
-        n_obs_steps=policy_cfg.data.n_obs_steps,
         output_features={"action": features["action"]}
     )
-
-    # --- [FIXED] Move the entire policy object to the selected device ---
-    combined_policy.to(device)
-    combined_policy.eval()
-    print("Combined policy pipeline is ready.")
+    policy.load_state_dict(torch.load(
+        cfg.planner_checkpoint_path, map_location=device))
+    policy.to(device).eval()
+    print("End-to-end policy pipeline is ready.")
 
     # --- LIBERO 벤치마크 및 환경 설정 ---
     benchmark_dict = get_benchmark_dict()
@@ -164,14 +140,9 @@ def main(cfg: EvalConfig):
             env.reset()
 
             init_state = task_init_states[trial_idx % len(task_init_states)]
+            # [MODIFIED] run_episode now takes the single policy object
             success, frames = run_episode(
-                policy=combined_policy,
-                env=env,
-                task_description=task_description,
-                initial_state=init_state,
-                device=device,
-                cfg=cfg
-            )
+                policy=policy, env=env, task=task, task_description=task_description, initial_state=init_state, device=device, cfg=cfg)
 
             if success:
                 task_successes += 1
@@ -194,74 +165,51 @@ def main(cfg: EvalConfig):
         f"Total Success Rate: {total_successes}/{total_episodes} ({overall_success_rate:.1f}%)")
 
 
-def run_episode(policy, env, task_description, initial_state, device, cfg: EvalConfig):
-    """ 한 에피소드를 실행하고 성공 여부와 렌더링된 프레임을 반환합니다. """
+def run_episode(policy, env, task, task_description, initial_state, device, cfg: EvalConfig):
+    """ [MODIFIED] This function is now much simpler. """
     policy.reset()
+    env.reset()
     env.set_init_state(initial_state)
 
-    # action_plan is now managed here
-    action_plan = deque()
+    obs, _, _, info = env.step(np.zeros(7))
+    frames = []
 
-    obs, _, _, _ = env.step(np.zeros(7))
+    # Wait for stabilization
+    for _ in range(cfg.num_steps_wait):
+        obs, _, _, info = env.step(np.zeros(7))
+    frames.append(np.flip(np.concatenate(
+        [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1), 0))
 
-    # Start recording frames immediately
-    concatenated_frame = np.concatenate(
-        [obs["frontview_image"], obs["robot0_eye_in_hand_image"]], axis=1)
-    frames = [np.flip(concatenated_frame, axis=0)]
+    # Main interaction loop
+    for _ in range(task.horizon - cfg.num_steps_wait):
+        # 1. Prepare observation dict from environment
+        state_np = np.concatenate([obs["robot0_eef_pos"], _quat2axisangle(
+            obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]])
+        state = torch.from_numpy(state_np).to(device, dtype=torch.float32)
+        front_img = torch.from_numpy(obs["frontview_image"]).to(
+            device).permute(2, 0, 1).to(torch.float32) / 255.0
+        wrist_img = torch.from_numpy(obs["robot0_eye_in_hand_image"]).to(
+            device).permute(2, 0, 1).to(torch.float32) / 255.0
+        image = torch.stack([front_img, wrist_img], dim=0)
 
-    max_steps = env.env.horizon
-    t = 0
+        observation_dict = {
+            "observation.image": image, "observation.state": state, "language_instruction": [task_description]
+        }
 
-    while t < max_steps - 1:
-        # Check if we need to replan (every replan_steps)
-        if t % cfg.replan_steps == 0:
-            # Construct observation dict for the policy
-            state_np = np.concatenate([obs["robot0_eef_pos"], _quat2axisangle(
-                obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]])
-            state = torch.from_numpy(state_np).to(
-                device, dtype=torch.float32).unsqueeze(0)
+        # 2. Get action from the self-contained policy
+        action_tensor = policy.select_action(observation_dict)
+        action = action_tensor.cpu().numpy()
 
-            front_img = torch.from_numpy(obs["frontview_image"]).permute(
-                2, 0, 1).to(device, dtype=torch.float32) / 255.0
-            wrist_img = torch.from_numpy(obs["robot0_eye_in_hand_image"]).permute(
-                2, 0, 1).to(device, dtype=torch.float32) / 255.0
-
-            image = torch.stack([front_img, wrist_img], dim=0).unsqueeze(0)
-
-            observation_dict = {
-                "observation.image": image,
-                "observation.state": state,
-                "language_instruction": [task_description]
-            }
-
-            # Generate a new chunk of actions
-            action_chunk = policy.plan_actions(observation_dict)
-            action_plan.extend(action_chunk)
-
-        # Get the next action from the plan
-        if not action_plan:
-            # If plan is empty, take a dummy action
-            action = np.zeros(7)
-            action[-1] = -1  # Gripper open
-        else:
-            action = action_plan.popleft().cpu().numpy()
-
+        # 3. Apply corrections and step
+        action[0:6] = -action[0:6]
         obs, _, terminated, info = env.step(action)
 
-        # Save frame for video
-        concatenated_frame = np.concatenate(
-            [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1)
-        frames.append(np.flip(concatenated_frame, axis=0))
-
+        frames.append(np.flip(np.concatenate(
+            [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1), 0))
         if terminated:
             break
 
-        t += 1
-
-    if "success" not in info:
-        info["success"] = False
-
-    return info["success"], frames
+    return info.get("success", False), frames
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ class VisionEncoderConfig:
     image_size: int = 224
     image_latent_dim: int = 512
     image_channels: int = 3
-    num_query_per_image: int = 9
+    num_query_per_image: int = 6
 
 
 @dataclass
@@ -35,6 +35,8 @@ class LanguageEncoderConfig:
 class HierarchicalTransformerConfig:
     """[MODIFIED] Configuration for the Hierarchical Autoregressive Transformer policy, inspired by Seer."""
     state_dim: int = 8  # Dynamically set from data
+    # [ADD] Action dimension for the forward prediction head
+    action_dim: int = 7
     hidden_dim: int = 384
     num_layers: int = 12
     num_heads: int = 12    # Seer uses 12

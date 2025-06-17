@@ -24,7 +24,7 @@ from model.predictor.normalization_utils import KeyMappingNormalizer
 def main():
     """Main training function."""
     cfg = PolicyConfig()
-    output_directory = Path("outputs/train/bidirectional_transformero")
+    output_directory = Path("outputs/train/bidirectional_transformere")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
