@@ -52,11 +52,11 @@ def _quat2axisangle(quat):
 @dataclass
 class EvalConfig:
     # --- 필수 설정 ---
-    planner_checkpoint_path: str = "outputs/train/bidirectional_transformere/model_final.pth"
+    planner_checkpoint_path: str = "outputs/train/bidirectional_transformere/model_step_930.pth"
 
     # --- LIBERO 벤치마크 설정 ---
     benchmark_name: str = "libero_object"
-    task_order_index: int = 4  # 사용할 태스크 순서 인덱스
+    task_order_index: int = 3  # 사용할 태스크 순서 인덱스
 
     # --- 평가 관련 설정 ---
     num_trials_per_task: int = 10

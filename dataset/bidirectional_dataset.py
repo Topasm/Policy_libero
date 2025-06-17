@@ -126,7 +126,7 @@ class BidirectionalTrajectoryDataset(Dataset):
         goal_images = torch.stack([goal_front, goal_wrist])
 
         # 3. Load future trajectories and handle padding
-        forward_actions, action_paddings, backward_states = [], [], []
+        action, action_paddings, backward_states = [], [], []
 
         # Load forward actions
         for j in range(self.forward_steps):
@@ -135,7 +135,7 @@ class BidirectionalTrajectoryDataset(Dataset):
             load_idx = min(fwd_idx, end_idx)
             fwd_data = self.lerobot_dataset[load_idx]
 
-            forward_actions.append(torch.as_tensor(
+            action.append(torch.as_tensor(
                 fwd_data['action'], dtype=torch.float32))
             action_paddings.append(torch.tensor(is_pad, dtype=torch.bool))
 
@@ -163,8 +163,8 @@ class BidirectionalTrajectoryDataset(Dataset):
             'initial_images': torch.stack(initial_images),
             'initial_states': torch.stack(initial_states),
             'goal_images': goal_images,
-            # Key is now forward_actions
-            'forward_actions': torch.stack(forward_actions),
+            # Key is now action
+            'action': torch.stack(action),
             'backward_states': torch.stack(backward_states),
             'action_is_pad': torch.stack(action_paddings),
             'normalized_timestep': torch.tensor(normalized_timestep, dtype=torch.float32),

@@ -84,7 +84,7 @@ class DataConfig:
 @dataclass
 class TrainingConfig:
     """[MODIFIED] Configuration for training, inspired by Seer."""
-    training_steps: int = 500  # A more realistic number of steps
+    training_steps: int = 1000  # A more realistic number of steps
     batch_size: int = 128      # Seer uses a large batch size for finetuning
     # Seer uses 1e-3 for FT, but 1e-4 is a safer starting point for pre-training
     learning_rate: float = 1e-4

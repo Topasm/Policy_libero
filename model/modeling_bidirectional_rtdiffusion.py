@@ -74,7 +74,7 @@ class HierarchicalPolicy(nn.Module):
 
         # 4. Perform a full forward pass to get a new action plan
         predictions = self.model.forward(**model_input_batch)
-        actions_normalized = predictions['predicted_forward_actions']
+        actions_normalized = predictions['predicted_action']
 
         # 5. Take only the FIRST action from the predicted plan
         # Take the first action chunk (length 1)

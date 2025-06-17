@@ -26,7 +26,7 @@ def main():
     cfg = PolicyConfig()
     output_directory = Path("outputs/train/bidirectional_transformere")
     output_directory.mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     # --- [MODIFIED] Wandb Initialization ---
     wandb.init(
@@ -58,7 +58,7 @@ def main():
     # [MODIFIED] Update output_features to reflect action prediction
     cfg.data.output_features = {
         # Changed from states to actions
-        "predicted_forward_actions": features["action"],
+        "predicted_action": features["action"],
         "predicted_backward_states": features["observation.state"],
         # Single 3-channel image
         "predicted_goal_images": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
@@ -111,6 +111,11 @@ def main():
     wrapped_normalizer = KeyMappingNormalizer(
         normalize_state_base, key_mapping)
 
+    normalize_action = Normalize(
+        {"action": features["action"]},
+        cfg.data.normalization_mapping, dataset_metadata.stats
+    )
+
     # --- Model, Optimizer, Scheduler ---
     model = HierarchicalAutoregressivePolicy(config=cfg)
     model.to(device)
@@ -145,6 +150,7 @@ def main():
                 break
 
             batch = wrapped_normalizer(batch)
+            batch = normalize_action(batch)
             batch_device = {
                 k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
             language_instructions = batch.get('language_instruction', [])
