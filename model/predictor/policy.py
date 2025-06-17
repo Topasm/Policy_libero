@@ -29,66 +29,69 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
     losses = {}
     weights = {
         'forward_action_loss_arm': 1.0,
-        'forward_action_loss_gripper': 0.01,
+        'forward_action_loss_gripper': 0.01,  # Seer 논문을 참고한 그리퍼 손실 가중치
         'backward_state_loss': 1.0,
         'goal_image_loss': 1.0,
         'progress_loss': 0.5
     }
 
-    # Goal Image Loss
+    # 1. Goal Image Reconstruction Loss (변경 없음)
     if 'predicted_goal_images' in predictions and 'goal_images' in targets:
         pred_img = predictions['predicted_goal_images']
         true_img_front = targets['goal_images'][:, 0]
-        if pred_img.shape[2:] != true_img_front.shape[2:]:
-            true_img_front = F.interpolate(
-                true_img_front, size=pred_img.shape[2:], mode='bilinear', align_corners=False)
         losses['goal_image_loss'] = F.mse_loss(pred_img, true_img_front)
 
-    # State Prediction Loss (Backward Plan)
-    if 'predicted_backward_states' in predictions and 'backward_states' in targets:
-        # Assuming backward states do not need padding mask, or a separate one would be needed
-        losses['backward_state_loss'] = F.l1_loss(
-            predictions['predicted_backward_states'], targets['backward_states'])
-
-    # Progress Prediction Loss
-    if 'predicted_progress' in predictions and 'normalized_timestep' in targets:
-        predicted = predictions['predicted_progress'].squeeze(-1)
-        target = targets['normalized_timestep']
-        losses['progress_loss'] = F.mse_loss(predicted, target)
-
-    # [MODIFIED] Calculate loss for forward ACTIONS
-    if 'predicted_forward_actions' in predictions and 'action' in targets:
+    # 2. [FIXED] Action Prediction Loss (Forward Plan)
+    if 'predicted_forward_actions' in predictions and 'forward_actions' in targets:
         pred_actions = predictions['predicted_forward_actions']
-        true_actions = targets['action'][:, :pred_actions.shape[1]]
-        pad_mask = targets['action_is_pad'][:, :pred_actions.shape[1]]
+        true_actions = targets['forward_actions']
+        pad_mask = targets['action_is_pad']
 
+        # 예측과 정답을 팔과 그리퍼로 분리
         pred_arm, pred_gripper_logit = pred_actions[...,
                                                     :6], pred_actions[..., 6:]
         true_arm, true_gripper = true_actions[..., :6], true_actions[..., 6:]
 
+        # 팔 행동에 대한 L1 Loss 계산
         loss_arm_per_element = F.l1_loss(pred_arm, true_arm, reduction='none')
 
-        true_gripper_bce = (true_gripper + 1.0) / 2.0
+        # 그리퍼 행동에 대한 BCE Loss 계산
+        true_gripper_bce = (true_gripper + 1.0) / 2.0  # 정답을 -1/1에서 0/1로 변환
         loss_gripper_per_element = F.binary_cross_entropy_with_logits(
             pred_gripper_logit, true_gripper_bce, reduction='none'
         )
 
+        # 패딩 마스크를 적용하여 '가짜' 데이터에 대한 손실은 0으로 만듦
         mask = ~pad_mask
         loss_arm_per_element *= mask.unsqueeze(-1)
         loss_gripper_per_element *= mask.unsqueeze(-1)
 
+        # 패딩을 제외한 실제 데이터에 대해서만 평균 손실 계산
         num_valid_elements = mask.sum()
         losses['forward_action_loss_arm'] = loss_arm_per_element.sum() / \
             (num_valid_elements * 6 + 1e-8)
         losses['forward_action_loss_gripper'] = loss_gripper_per_element.sum(
         ) / (num_valid_elements * 1 + 1e-8)
 
+    # 3. State Prediction Loss (Backward Plan)
+    if 'predicted_backward_states' in predictions and 'backward_states' in targets:
+        losses['backward_state_loss'] = F.l1_loss(
+            predictions['predicted_backward_states'], targets['backward_states'])
+
+    # 4. Progress Prediction Loss
+    if 'predicted_progress' in predictions and 'normalized_timestep' in targets:
+        predicted = predictions['predicted_progress'].squeeze(-1)
+        target = targets['normalized_timestep']
+        losses['progress_loss'] = F.mse_loss(predicted, target)
+
+    # 전체 가중치 합산 손실 계산
     total_loss = torch.tensor(0.0, device=next(
         iter(predictions.values())).device)
     for name, loss in losses.items():
-        if name in weights and loss is not None and loss.numel() > 0:
+        if name in weights and loss.numel() > 0:
             total_loss += loss * weights.get(name, 1.0)
     losses['total_loss'] = total_loss
+
     return losses
 
 
