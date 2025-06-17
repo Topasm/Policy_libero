@@ -44,35 +44,6 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
                 true_img_front, size=pred_img.shape[2:], mode='bilinear', align_corners=False)
         losses['goal_image_loss'] = F.mse_loss(pred_img, true_img_front)
 
-    # Action Prediction Loss (Forward Plan)
-    if 'predicted_forward_actions' in predictions and 'action' in targets:
-        pred_actions = predictions['predicted_forward_actions']
-        true_actions = targets['action'][:, :pred_actions.shape[1]]
-        pad_mask = targets['action_is_pad'][:, :pred_actions.shape[1]]
-
-        pred_arm, pred_gripper_logit = pred_actions[...,
-                                                    :6], pred_actions[..., 6:]
-        true_arm, true_gripper = true_actions[..., :6], true_actions[..., 6:]
-
-        # L1 Loss for arm
-        loss_arm_per_element = F.l1_loss(pred_arm, true_arm, reduction='none')
-
-        # BCE Loss for gripper
-        true_gripper_bce = (true_gripper + 1.0) / 2.0
-        loss_gripper_per_element = F.binary_cross_entropy_with_logits(
-            pred_gripper_logit, true_gripper_bce, reduction='none')
-
-        # Apply padding mask
-        mask = ~pad_mask
-        loss_arm_per_element *= mask.unsqueeze(-1)
-        loss_gripper_per_element *= mask.unsqueeze(-1)
-
-        num_valid_elements = mask.sum()
-        losses['forward_action_loss_arm'] = loss_arm_per_element.sum() / \
-            (num_valid_elements * 6 + 1e-8)
-        losses['forward_action_loss_gripper'] = loss_gripper_per_element.sum(
-        ) / (num_valid_elements * 1 + 1e-8)
-
     # State Prediction Loss (Backward Plan)
     if 'predicted_backward_states' in predictions and 'backward_states' in targets:
         # Assuming backward states do not need padding mask, or a separate one would be needed
@@ -85,17 +56,44 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
         target = targets['normalized_timestep']
         losses['progress_loss'] = F.mse_loss(predicted, target)
 
-    # Calculate total weighted loss
-    total_loss = torch.tensor(0.0, device=next(iter(losses.values())).device)
+    # [MODIFIED] Calculate loss for forward ACTIONS
+    if 'predicted_forward_actions' in predictions and 'action' in targets:
+        pred_actions = predictions['predicted_forward_actions']
+        true_actions = targets['action'][:, :pred_actions.shape[1]]
+        pad_mask = targets['action_is_pad'][:, :pred_actions.shape[1]]
+
+        pred_arm, pred_gripper_logit = pred_actions[...,
+                                                    :6], pred_actions[..., 6:]
+        true_arm, true_gripper = true_actions[..., :6], true_actions[..., 6:]
+
+        loss_arm_per_element = F.l1_loss(pred_arm, true_arm, reduction='none')
+
+        true_gripper_bce = (true_gripper + 1.0) / 2.0
+        loss_gripper_per_element = F.binary_cross_entropy_with_logits(
+            pred_gripper_logit, true_gripper_bce, reduction='none'
+        )
+
+        mask = ~pad_mask
+        loss_arm_per_element *= mask.unsqueeze(-1)
+        loss_gripper_per_element *= mask.unsqueeze(-1)
+
+        num_valid_elements = mask.sum()
+        losses['forward_action_loss_arm'] = loss_arm_per_element.sum() / \
+            (num_valid_elements * 6 + 1e-8)
+        losses['forward_action_loss_gripper'] = loss_gripper_per_element.sum(
+        ) / (num_valid_elements * 1 + 1e-8)
+
+    total_loss = torch.tensor(0.0, device=next(
+        iter(predictions.values())).device)
     for name, loss in losses.items():
-        if name in weights and loss.numel() > 0:
+        if name in weights and loss is not None and loss.numel() > 0:
             total_loss += loss * weights.get(name, 1.0)
     losses['total_loss'] = total_loss
     return losses
 
 
 class HierarchicalAutoregressivePolicy(nn.Module):
-    def __init__(self, config: PolicyConfig, dataset_stats: dict = None, output_features: dict = None, **kwargs):
+    def __init__(self, config: PolicyConfig, **kwargs):
         super().__init__()
         self.config = config
         h_cfg = config.hierarchical_transformer
@@ -123,7 +121,7 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         self.bwd_query = nn.Parameter(torch.randn(
             1, h_cfg.backward_steps, h_cfg.hidden_dim))
         self.action_query = nn.Parameter(torch.randn(
-            1, d_cfg.n_action_steps, h_cfg.hidden_dim))  # Predicts actions now
+            1, d_cfg.n_action_steps, h_cfg.hidden_dim))
 
         # --- Positional Embedding ---
         num_lang_tokens = 1
@@ -157,31 +155,16 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         # Progress Head (single output for progress predictio
         self.progress_head = nn.Linear(h_cfg.hidden_dim, 1)
 
-        # Action Decoder Head (MLP with separate heads for arm/gripper)
         self.action_decoder_body = nn.Sequential(
             nn.Linear(h_cfg.hidden_dim, mlp_hidden_dim),
-            nn.ReLU())
+            nn.ReLU(inplace=True),
+        )
         self.action_decoder_arm_head = nn.Sequential(
-            nn.Linear(mlp_hidden_dim, 6), nn.Tanh())
-        self.action_decoder_gripper_head = nn.Linear(mlp_hidden_dim, 1)
-
-        # --- [MODIFIED] 추론(evaluation)을 위한 모듈 초기화 ---
-        self.dataset_stats = dataset_stats
-        self.output_features = output_features
-
-        if self.dataset_stats and self.output_features:
-            self.normalize_inputs = Normalize(
-                d_cfg.input_features, d_cfg.normalization_mapping, self.dataset_stats)
-            self.unnormalize_outputs = Unnormalize(
-                self.output_features, d_cfg.normalization_mapping, self.dataset_stats)
-
-        self.observation_queue = deque(maxlen=d_cfg.n_obs_steps)
-        self.action_queue = deque()
-
-    def reset(self):
-        """평가 에피소드 시작 시 큐를 리셋합니다."""
-        self.observation_queue.clear()
-        self.action_queue.clear()
+            nn.Linear(mlp_hidden_dim, 6),
+            nn.Tanh()
+        )
+        self.action_decoder_gripper_head = nn.Linear(
+            mlp_hidden_dim, 1)  # Outputs logits
 
     def forward(self, initial_images, initial_states, language_instruction, **kwargs):
         batch_size, n_obs_steps = initial_images.shape[:2]
@@ -212,7 +195,7 @@ class HierarchicalAutoregressivePolicy(nn.Module):
             self.progress_query.expand(batch_size, -1, -1),
             self.goal_query.expand(batch_size, -1, -1),
             self.bwd_query.expand(batch_size, -1, -1),
-            self.action_query.expand(batch_size, -1, -1)  # Use action_query
+            self.action_query.expand(batch_size, -1, -1)
         ], dim=1)
         seq = torch.cat([history_embeds, query_embeds], dim=1)
         seq = seq + self.pos_embed[:, :seq.shape[1], :]
@@ -244,14 +227,15 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         bwd_h_sequence = out[:, bwd_start:action_start]
         action_h_sequence = out[:, action_start:]
 
-        # 6. Final Predictions
+        # --- [MODIFIED] Generate final predictions ---
+        pred_bwd_states = self.bwd_head(bwd_h_sequence)
         shared_features = self.action_decoder_body(action_h_sequence)
         pred_arm = self.action_decoder_arm_head(shared_features)
         pred_gripper_logit = self.action_decoder_gripper_head(shared_features)
         pred_fwd_actions = torch.cat([pred_arm, pred_gripper_logit], dim=-1)
 
         preds = {
-            "predicted_backward_states": self.bwd_head(bwd_h_sequence),
+            "predicted_backward_states": pred_bwd_states,
             "predicted_forward_actions": pred_fwd_actions,
             "predicted_goal_images": self.image_decoder(self.goal_head(goal_h)),
             "predicted_progress": torch.sigmoid(self.progress_head(prog_h)),

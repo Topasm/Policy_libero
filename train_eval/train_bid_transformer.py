@@ -55,11 +55,13 @@ def main():
     c, h, w = features[example_key].shape
     combined_c = c * len(cfg.data.image_keys)
 
+    # [MODIFIED] Update output_features to reflect action prediction
     cfg.data.output_features = {
-        "predicted_forward_states": features["observation.state"],
+        # Changed from states to actions
+        "predicted_forward_actions": features["action"],
         "predicted_backward_states": features["observation.state"],
-        # Create a new PolicyFeature object instead of using ._replace
-        "predicted_goal_images": PolicyFeature(type=FeatureType.VISUAL, shape=(combined_c, h, w)),
+        # Single 3-channel image
+        "predicted_goal_images": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
     }
     # --- END FIX ---
 
@@ -101,9 +103,9 @@ def main():
         cfg.data.normalization_mapping,
         dataset_metadata.stats
     )
+    # [MODIFIED] Remove 'forward_states' from the normalization key mapping
     key_mapping = {
         "initial_states": "observation.state",
-        "forward_states": "observation.state",
         "backward_states": "observation.state"
     }
     wrapped_normalizer = KeyMappingNormalizer(
