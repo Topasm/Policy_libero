@@ -52,11 +52,11 @@ def _quat2axisangle(quat):
 @dataclass
 class EvalConfig:
     # --- 필수 설정 ---
-    planner_checkpoint_path: str = "outputs/train/bidirectional_transformere/model_step_930.pth"
+    planner_checkpoint_path: str = "outputs/train/bidirectional_transformere/model_step_870.pth"
 
     # --- LIBERO 벤치마크 설정 ---
     benchmark_name: str = "libero_object"
-    task_order_index: int = 3  # 사용할 태스크 순서 인덱스
+    task_order_index: int = 2  # 사용할 태스크 순서 인덱스
 
     # --- 평가 관련 설정 ---
     num_trials_per_task: int = 10
@@ -157,7 +157,7 @@ def main(cfg: EvalConfig):
             env = OffScreenRenderEnv(
                 bddl_file_name=task_suite.get_task_bddl_file_path(task_idx),
                 control_freq=20,
-                camera_names=["frontview", "robot0_eye_in_hand"],
+                camera_names=["agentview", "robot0_eye_in_hand"],
                 camera_heights=256,
                 camera_widths=256
             )
@@ -209,7 +209,7 @@ def run_episode(policy: HierarchicalPolicy, env, task_description, initial_obs, 
 
     # Record first frame after stabilization
     concatenated_frame = np.concatenate(
-        [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1)
+        [obs["robot0_eye_in_hand_image"], obs["agentview_image"]], axis=1)
     frames.append(np.flip(concatenated_frame, axis=0))
 
     t = 0
@@ -221,7 +221,7 @@ def run_episode(policy: HierarchicalPolicy, env, task_description, initial_obs, 
             obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]])
         state = torch.from_numpy(state_np).to(device, dtype=torch.float32)
 
-        front_img = torch.from_numpy(obs["frontview_image"]).to(
+        front_img = torch.from_numpy(obs["agentview_image"]).to(
             device, non_blocking=True).permute(2, 0, 1).to(torch.float32)
         wrist_img = torch.from_numpy(obs["robot0_eye_in_hand_image"]).to(
             device, non_blocking=True).permute(2, 0, 1).to(torch.float32)
@@ -237,7 +237,7 @@ def run_episode(policy: HierarchicalPolicy, env, task_description, initial_obs, 
         obs, _, terminated, info = env.step(action)
 
         frames.append(np.flip(np.concatenate(
-            [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1), 0))
+            [obs["robot0_eye_in_hand_image"], obs["agentview_image"]], axis=1), 0))
 
         if terminated:
             break

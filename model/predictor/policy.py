@@ -30,9 +30,9 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
     weights = {
         'forward_action_loss_arm': 1.0,
         'forward_action_loss_gripper': 0.01,  # Seer 논문을 참고한 그리퍼 손실 가중치
-        'backward_state_loss': 1.0,
-        'goal_image_loss': 1.0,
-        'progress_loss': 0.5
+        'backward_state_loss': 0.1,
+        'goal_image_loss': 0.1,
+        'progress_loss': 1.0,
     }
 
     if 'predicted_goal_images' in predictions and 'goal_images' in targets:
