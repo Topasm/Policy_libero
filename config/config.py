@@ -63,7 +63,7 @@ class DataConfig:
                                   "observation.images.image", "observation.images.wrist_image"])
     n_obs_steps: int = 7       # Seer uses a history length of 7 for LIBERO
     horizon: int = 16
-    n_action_steps: int = 1
+    n_action_steps: int = 16
     diffusion_target_key: str = "observation.state"
     interpolate_state: bool = True
     state_delta_indices: List[int] = field(
