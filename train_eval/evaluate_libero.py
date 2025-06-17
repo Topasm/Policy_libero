@@ -2,21 +2,30 @@
 
 from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from model.invdyn.invdyn import MlpInvDynamic
 from config.config import PolicyConfig
 from model.predictor.policy import HierarchicalAutoregressivePolicy
 from libero.libero.envs import OffScreenRenderEnv
 from libero.libero.benchmark import get_benchmark_dict
+from model.modeling_bidirectional_rtdiffusion import HierarchicalPolicy
 import torch
 import numpy as np
 import imageio
-import tqdm
+from tqdm import tqdm
 from pathlib import Path
 from dataclasses import dataclass, field
 import draccus
 import os
 import math
 from collections import deque
+
+from libero.libero.benchmark import get_benchmark_dict
+from libero.libero.envs import OffScreenRenderEnv
+
+from model.predictor.policy import HierarchicalAutoregressivePolicy
+from config.config import PolicyConfig
+from model.modeling_bidirectional_rtdiffusion import HierarchicalPolicy
+from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from lerobot.common.datasets.utils import dataset_to_policy_features
 
 # 토크나이저 병렬 처리 경고 비활성화
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -43,7 +52,7 @@ def _quat2axisangle(quat):
 @dataclass
 class EvalConfig:
     # --- 필수 설정 ---
-    planner_checkpoint_path: str = "outputs/train/bidirectional_transformer/model_final.pth"
+    planner_checkpoint_path: str = "outputs/train/bidirectional_transformere/model_final.pth"
 
     # --- LIBERO 벤치마크 설정 ---
     benchmark_name: str = "libero_object"
@@ -57,7 +66,7 @@ class EvalConfig:
     output_dir: str = "outputs/eval/libero_benchmark"
 
     # [MODIFIED] Added parameters for stabilization and replanning
-    num_steps_wait: int = 5
+    num_steps_wait: int = 10
     replan_steps: int = 4
 
 
@@ -84,15 +93,22 @@ def main(cfg: EvalConfig):
     features = dataset_to_policy_features(metadata.features)
 
     # a. 계획 모델 (Planner) 로딩
-    policy = HierarchicalAutoregressivePolicy(
-        config=policy_cfg,
-        dataset_stats=metadata.stats,
-        output_features={"action": features["action"]}
-    )
-    policy.load_state_dict(torch.load(
+    planner_model = HierarchicalAutoregressivePolicy(config=policy_cfg)
+    planner_model.load_state_dict(torch.load(
         cfg.planner_checkpoint_path, map_location=device))
-    policy.to(device).eval()
-    print("End-to-end policy pipeline is ready.")
+    planner_model.to(device).eval()
+    print(f"Planner model loaded from: {cfg.planner_checkpoint_path}")
+
+    # c. 통합 정책 파이프라인 생성 (Wrapper class usage)
+    policy = HierarchicalPolicy(
+        policy_model=planner_model,  # The end-to-end model is passed here
+        dataset_stats=metadata.stats,
+        output_features={"action": features["action"]},
+        config=policy_cfg
+    )
+    print("Policy wrapper with per-step replanning is ready.")
+
+    policy.to(device)
 
     # --- LIBERO 벤치마크 및 환경 설정 ---
     benchmark_dict = get_benchmark_dict()
@@ -111,6 +127,18 @@ def main(cfg: EvalConfig):
     total_successes = 0
     total_episodes = 0
 
+    # [MODIFIED] Set max_steps based on task suite name, like in Seer
+    if cfg.benchmark_name == "libero_spatial":
+        max_steps = 220
+    elif cfg.benchmark_name == "libero_object":
+        max_steps = 580
+    elif cfg.benchmark_name == "libero_goal":
+        max_steps = 300
+    elif cfg.benchmark_name == "libero_10":
+        max_steps = 520
+    else:
+        max_steps = 400  # Default for other suites like libero_90
+
     for task_idx, task_name in enumerate(task_names):
         print(
             f"\n===== Evaluating Task {task_idx+1}/{n_tasks}: {task_name} =====")
@@ -124,25 +152,33 @@ def main(cfg: EvalConfig):
             task_idx)
         # --- 여기까지 수정 ---
 
-        for trial_idx in tqdm.tqdm(range(cfg.num_trials_per_task), desc=f"Task '{task_name}'"):
+        for trial_idx in tqdm(range(cfg.num_trials_per_task), desc=f"Task '{task_name}'"):
             total_episodes += 1
-            # --- 바로 이 부분을 수정하시면 됩니다 ---
             env = OffScreenRenderEnv(
                 bddl_file_name=task_suite.get_task_bddl_file_path(task_idx),
                 control_freq=20,
-                # 전면, 손목 카메라 활성화
                 camera_names=["frontview", "robot0_eye_in_hand"],
-                camera_heights=256,  # 경고 메시지 방지를 위해 16의 배수로 수정
+                camera_heights=256,
                 camera_widths=256
             )
-            # --- 여기까지 수정 ---
             env.seed(cfg.seed + trial_idx)
-            env.reset()
 
             init_state = task_init_states[trial_idx % len(task_init_states)]
-            # [MODIFIED] run_episode now takes the single policy object
+            obs = env.set_init_state(init_state)
+
+            # [MODIFIED] Wait for simulation to stabilize here in the main loop
+            for _ in range(cfg.num_steps_wait):
+                obs, _, _, _ = env.step(np.zeros(7))
+
+            # Pass the stabilized obs and max_steps to run_episode
             success, frames = run_episode(
-                policy=policy, env=env, task=task, task_description=task_description, initial_state=init_state, device=device, cfg=cfg)
+                policy=policy,
+                env=env,
+                task_description=task_description,
+                initial_obs=obs,
+                max_steps=max_steps,
+                device=device
+            )
 
             if success:
                 task_successes += 1
@@ -153,7 +189,6 @@ def main(cfg: EvalConfig):
             imageio.mimsave(str(video_path), frames, fps=30)
 
             env.close()
-
         task_success_rate = (task_successes / cfg.num_trials_per_task) * 100
         print(
             f"Result for '{task_name}': {task_successes}/{cfg.num_trials_per_task} ({task_success_rate:.1f}%) successful.")
@@ -165,49 +200,49 @@ def main(cfg: EvalConfig):
         f"Total Success Rate: {total_successes}/{total_episodes} ({overall_success_rate:.1f}%)")
 
 
-def run_episode(policy, env, task, task_description, initial_state, device, cfg: EvalConfig):
-    """ [MODIFIED] This function is now much simpler. """
+def run_episode(policy: HierarchicalPolicy, env, task_description, initial_obs, max_steps, device):
+    """ [MODIFIED] The evaluation loop is now simpler and more robust. """
     policy.reset()
-    env.reset()
-    env.set_init_state(initial_state)
 
-    obs, _, _, info = env.step(np.zeros(7))
+    obs = initial_obs
     frames = []
 
-    # Wait for stabilization
-    for _ in range(cfg.num_steps_wait):
-        obs, _, _, info = env.step(np.zeros(7))
-    frames.append(np.flip(np.concatenate(
-        [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1), 0))
+    # Record first frame after stabilization
+    concatenated_frame = np.concatenate(
+        [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1)
+    frames.append(np.flip(concatenated_frame, axis=0))
 
-    # Main interaction loop
-    for _ in range(task.horizon - cfg.num_steps_wait):
-        # 1. Prepare observation dict from environment
+    t = 0
+    terminated = False
+    info = {}
+
+    while t < max_steps:
         state_np = np.concatenate([obs["robot0_eef_pos"], _quat2axisangle(
             obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]])
         state = torch.from_numpy(state_np).to(device, dtype=torch.float32)
+
         front_img = torch.from_numpy(obs["frontview_image"]).to(
-            device).permute(2, 0, 1).to(torch.float32) / 255.0
+            device, non_blocking=True).permute(2, 0, 1).to(torch.float32)
         wrist_img = torch.from_numpy(obs["robot0_eye_in_hand_image"]).to(
-            device).permute(2, 0, 1).to(torch.float32) / 255.0
+            device, non_blocking=True).permute(2, 0, 1).to(torch.float32)
         image = torch.stack([front_img, wrist_img], dim=0)
 
         observation_dict = {
             "observation.image": image, "observation.state": state, "language_instruction": [task_description]
         }
 
-        # 2. Get action from the self-contained policy
+        # Replanning happens inside select_action on every step
         action_tensor = policy.select_action(observation_dict)
         action = action_tensor.cpu().numpy()
-
-        # 3. Apply corrections and step
-        action[0:6] = -action[0:6]
         obs, _, terminated, info = env.step(action)
 
         frames.append(np.flip(np.concatenate(
             [obs["robot0_eye_in_hand_image"], obs["frontview_image"]], axis=1), 0))
+
         if terminated:
             break
+
+        t += 1
 
     return info.get("success", False), frames
 

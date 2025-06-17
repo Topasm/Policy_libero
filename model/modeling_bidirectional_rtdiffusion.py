@@ -1,115 +1,88 @@
 import torch
-from torch import nn
+import torch.nn as nn
 from collections import deque
-import numpy as np
 
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 
 
 class HierarchicalPolicy(nn.Module):
-    def __init__(
-        self,
-        bidirectional_transformer: nn.Module,
-        inverse_dynamics_model: nn.Module,
-        dataset_stats,
-        all_dataset_features,
-        n_obs_steps,
-        output_features,
-    ):
+    """
+    A policy wrapper for evaluation that implements per-step replanning.
+    It manages observation history and calls the underlying model on every step.
+    """
+
+    def __init__(self, policy_model, dataset_stats, output_features, config):
         super().__init__()
-        self.bidirectional_transformer = bidirectional_transformer
-        self.config = bidirectional_transformer.config
-        self.inverse_dynamics_model = inverse_dynamics_model
-        self.n_obs_steps = n_obs_steps
+
+        self.model = policy_model
+        self.config = config
+        # 이미 output_features를 저장하고 있습니다.
         self.output_features = output_features
 
+        # Create normalizers here for inference
+        d_cfg = self.config.data
         self.normalize_inputs = Normalize(
-            self.config.data.input_features,
-            self.config.data.normalization_mapping,
-            dataset_stats
-        )
+            d_cfg.input_features, d_cfg.normalization_mapping, dataset_stats)
         self.unnormalize_outputs = Unnormalize(
-            output_features,
-            self.config.data.normalization_mapping,
-            dataset_stats
-        )
+            self.output_features, d_cfg.normalization_mapping, dataset_stats)
 
-        # This queue is now only for observation history
-        self.observation_queue = deque(maxlen=self.n_obs_steps)
+        # These are not model parameters, so they won't be moved by .to(device), which is correct.
+        self.observation_queue = deque(maxlen=d_cfg.n_obs_steps)
+        self.action_queue = deque()
         self.reset()
 
     def reset(self):
-        """Reset observation history queue."""
+        """Resets the observation history queue for a new episode."""
         self.observation_queue.clear()
+        self.action_queue.clear()
 
     @torch.no_grad()
-    def plan_actions(self, current_raw_observation: dict) -> list[torch.Tensor]:
+    def select_action(self, observation_dict: dict) -> torch.Tensor:
         """
-        Takes the current observation, generates a plan, and returns a
-        sequence of action tensors (action chunk).
+        Selects an action by performing a full planning pass on every call.
         """
-        # Add a batch dimension if not present
-        for key in current_raw_observation:
-            if isinstance(current_raw_observation[key], torch.Tensor) and current_raw_observation[key].ndim in [1, 3]:
-                current_raw_observation[key] = current_raw_observation[key].unsqueeze(
-                    0)
+        self.model.eval()
+        device = next(self.model.parameters()).device
 
-        normalized_obs = self.normalize_inputs(current_raw_observation)
+        # 1. Preprocess observation and add to history queue
+        # Ensure input tensors are on the same device as the normalizers
+        for key, value in observation_dict.items():
+            if isinstance(value, torch.Tensor):
+                observation_dict[key] = value.unsqueeze(0).to(device)
 
-        obs_for_queue = {
-            # Remove batch dim for queue
+        normalized_obs = self.normalize_inputs(observation_dict)
+
+        self.observation_queue.append({
             "observation.image": normalized_obs["observation.image"].squeeze(0),
             "observation.state": normalized_obs["observation.state"].squeeze(0),
-        }
-        self.observation_queue.append(obs_for_queue)
+        })
 
-        # Return empty list if there isn't enough history
-        if len(self.observation_queue) < self.n_obs_steps:
-            return []
+        # 2. Return a dummy action if history is not yet full
+        if len(self.observation_queue) < self.config.data.n_obs_steps:
+            # [FIXED] unnormalize_outputs 대신, 클래스에 저장된 self.output_features를 사용합니다.
+            action_dim = self.output_features["action"].shape[-1]
+            return torch.zeros(action_dim, device=device)
 
-        # Prepare batch for the model from history
+        # 3. Prepare model input from the full observation history
         model_input_batch = {
-            "initial_images": torch.stack([obs["observation.image"] for obs in self.observation_queue]).unsqueeze(0),
-            "initial_states": torch.stack([obs["observation.state"] for obs in self.observation_queue]).unsqueeze(0),
-            "language_instruction": current_raw_observation["language_instruction"]
+            "initial_images": torch.stack([obs["observation.image"]
+                                           for obs in self.observation_queue]).unsqueeze(0),
+            "initial_states": torch.stack([obs["observation.state"]
+                                           for obs in self.observation_queue]).unsqueeze(0),
+            "language_instruction": observation_dict["language_instruction"]
         }
 
-        state_plan = self._generate_state_plan(model_input_batch)
-        actions_normalized = self._generate_actions_from_states(state_plan)
-        actions_denormalized = self.unnormalize_outputs(
-            {"action": actions_normalized})["action"]
+        # 4. Perform a full forward pass to get a new action plan
+        predictions = self.model.forward(**model_input_batch)
+        actions_normalized = predictions['predicted_forward_actions']
 
-        # Return a list of action tensors
-        return list(actions_denormalized.squeeze(0))
+        # 5. Take only the FIRST action from the predicted plan
+        # Take the first action chunk (length 1)
+        next_action_normalized = actions_normalized[:, :1, :]
 
-    def _generate_state_plan(self, model_input_batch: dict) -> torch.Tensor:
-        """Generates a sequence of future states using the planner."""
-        predictions = self.bidirectional_transformer.generate(
-            **model_input_batch)
-        return predictions['predicted_forward_states']
+        # 6. Denormalize the single action
+        action_denormalized = self.unnormalize_outputs(
+            {"action": next_action_normalized})["action"]
 
-    def _generate_actions_from_states(self, state_plan: torch.Tensor) -> torch.Tensor:
-        """
-        Generates a shorter sequence of actions (action chunk) from the state plan.
-        """
-        # --- [FIXED] Use only a short horizon of the plan for action generation ---
-        # The planner generates a long state plan (e.g., 32 steps), but we only
-        # convert a shorter chunk into actions to be queued. This is more stable.
-        # Get horizon from config (e.g., 8)
-        action_horizon = self.config.data.n_action_steps
-
-        # We need action_horizon+1 states to generate action_horizon actions (a_0 to a_{H-1})
-        # This requires states s_0 to s_H.
-        state_plan_chunk = state_plan[:, :action_horizon + 1]
-        # --- END FIX ---
-
-        actions = []
-        # Loop over the shorter state plan chunk
-        # This will create pairs (s_0, s_1), (s_1, s_2), ..., (s_{H-1}, s_H)
-        for i in range(state_plan_chunk.size(1) - 1):
-            s_t = state_plan_chunk[:, i, :]
-            s_t_plus_1 = state_plan_chunk[:, i + 1, :]
-            action = self.inverse_dynamics_model(s_t, s_t_plus_1)
-            actions.append(action)
-
-        return torch.stack(actions, dim=1)
+        # Return a single action tensor
+        return action_denormalized.squeeze(0).squeeze(0)

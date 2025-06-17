@@ -47,17 +47,6 @@ class HierarchicalTransformerConfig:
 
 
 @dataclass
-class InverseDynamicsConfig:
-    """Configuration for the Inverse Dynamics model."""
-    hidden_dim: int = 512  # Increased capacity
-    dropout: float = 0.1
-    use_layernorm: bool = True
-    out_activation: str = "Tanh"
-    # [ADD] Weight for the gripper BCE loss, inspired by Seer paper
-    gripper_loss_weight: float = 0.01
-
-
-@dataclass
 class StateDiffusionConfig:
     """Configuration specific to the State-prediction Diffusion model."""
     noise_scheduler_type: str = "DDPM"
@@ -95,13 +84,13 @@ class DataConfig:
 @dataclass
 class TrainingConfig:
     """[MODIFIED] Configuration for training, inspired by Seer."""
-    training_steps: int = 20000  # A more realistic number of steps
+    training_steps: int = 500  # A more realistic number of steps
     batch_size: int = 128      # Seer uses a large batch size for finetuning
     # Seer uses 1e-3 for FT, but 1e-4 is a safer starting point for pre-training
     learning_rate: float = 1e-4
     weight_decay: float = 1e-6
-    log_freq: int = 1000
-    save_freq: int = 3000
+    log_freq: int = 10
+    save_freq: int = 30
     num_workers: int = 8
     lr_scheduler_T_max_mult: int = 1
 
@@ -125,8 +114,6 @@ class PolicyConfig:
         default_factory=LanguageEncoderConfig)
     hierarchical_transformer: HierarchicalTransformerConfig = field(
         default_factory=HierarchicalTransformerConfig)
-    inverse_dynamics: InverseDynamicsConfig = field(
-        default_factory=InverseDynamicsConfig)
     state_diffusion: StateDiffusionConfig = field(
         default_factory=StateDiffusionConfig)
     data: DataConfig = field(default_factory=DataConfig)
