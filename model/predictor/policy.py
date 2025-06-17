@@ -35,10 +35,12 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
         'progress_loss': 0.5
     }
 
-    # 1. Goal Image Reconstruction Loss (변경 없음)
     if 'predicted_goal_images' in predictions and 'goal_images' in targets:
         pred_img = predictions['predicted_goal_images']
         true_img_front = targets['goal_images'][:, 0]
+        if pred_img.shape[2:] != true_img_front.shape[2:]:
+            true_img_front = F.interpolate(
+                true_img_front, size=pred_img.shape[2:], mode='bilinear', align_corners=False)
         losses['goal_image_loss'] = F.mse_loss(pred_img, true_img_front)
 
     # 2. [FIXED] Action Prediction Loss (Forward Plan)
