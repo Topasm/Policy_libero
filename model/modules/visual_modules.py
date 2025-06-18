@@ -172,8 +172,11 @@ class ImageDecoder(nn.Module):
                                kernel_size=4, stride=2, padding=1), nn.Sigmoid()
         )
 
-    # [MODIFIED] Reverted to single-latent-input, single-image-output structure.
-    def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        """ Decodes a single latent vector into a single image. """
-        x = self.initial_linear(latents).view(-1, 512, 4, 4)
-        return self.decoder(x)
+    # [MODIFIED] The forward method now accepts two latents and returns two images.
+    def forward(self, latent_front: torch.Tensor, latent_wrist: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """ Decodes two latent vectors into two separate images by reusing the same decoder weights. """
+        x_front = self.initial_linear(latent_front).view(-1, 512, 4, 4)
+        pred_front = self.decoder(x_front)
+        x_wrist = self.initial_linear(latent_wrist).view(-1, 512, 4, 4)
+        pred_wrist = self.decoder(x_wrist)
+        return pred_front, pred_wrist

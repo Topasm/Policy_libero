@@ -29,71 +29,69 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
     losses = {}
     weights = {
         'forward_action_loss_arm': 1.0,
-        'forward_action_loss_gripper': 0.01,  # Seer 논문을 참고한 그리퍼 손실 가중치
-        'backward_state_loss': 0.1,
-        'goal_image_loss': 0.1,
-        'progress_loss': 1.0,
+        'forward_action_loss_gripper': 0.01,
+        'backward_state_loss': 1.0,
+        'goal_image_loss': 1.0,  # This will be the sum of both image losses
+        'progress_loss': 0.5
     }
 
-    if 'predicted_goal_images' in predictions and 'goal_images' in targets:
-        pred_img = predictions['predicted_goal_images']
-        true_img_front = targets['goal_images'][:, 0]
-        if pred_img.shape[2:] != true_img_front.shape[2:]:
-            true_img_front = F.interpolate(
-                true_img_front, size=pred_img.shape[2:], mode='bilinear', align_corners=False)
-        losses['goal_image_loss'] = F.mse_loss(pred_img, true_img_front)
+    # [MODIFIED] Calculate loss for both front and wrist goal images
+    if 'predicted_goal_image_front' in predictions and 'goal_images' in targets:
+        pred_front = predictions['predicted_goal_image_front']
+        pred_wrist = predictions['predicted_goal_image_wrist']
 
-    # 2. [FIXED] Action Prediction Loss (Forward Plan)
-    if 'predicted_action' in predictions and 'action' in targets:
-        pred_actions = predictions['predicted_action']
-        true_actions = targets['action']
-        pad_mask = targets['action_is_pad']
+        true_front = targets['goal_images'][:, 0]
+        true_wrist = targets['goal_images'][:, 1]
 
-        # 예측과 정답을 팔과 그리퍼로 분리
+        loss_front = F.mse_loss(pred_front, true_front)
+        loss_wrist = F.mse_loss(pred_wrist, true_wrist)
+        losses['goal_image_loss'] = loss_front + loss_wrist
+
+    # State Prediction Loss (Backward Plan)
+    if 'predicted_backward_states' in predictions and 'backward_states' in targets:
+        # Assuming backward states do not need padding mask, or a separate one would be needed
+        losses['backward_state_loss'] = F.l1_loss(
+            predictions['predicted_backward_states'], targets['backward_states'])
+
+    # Progress Prediction Loss
+    if 'predicted_progress' in predictions and 'normalized_timestep' in targets:
+        predicted = predictions['predicted_progress'].squeeze(-1)
+        target = targets['normalized_timestep']
+        losses['progress_loss'] = F.mse_loss(predicted, target)
+
+    # [MODIFIED] Calculate loss for forward ACTIONS
+    if 'predicted_forward_actions' in predictions and 'action' in targets:
+        pred_actions = predictions['predicted_forward_actions']
+        true_actions = targets['action'][:, :pred_actions.shape[1]]
+        pad_mask = targets['action_is_pad'][:, :pred_actions.shape[1]]
+
         pred_arm, pred_gripper_logit = pred_actions[...,
                                                     :6], pred_actions[..., 6:]
         true_arm, true_gripper = true_actions[..., :6], true_actions[..., 6:]
 
-        # 팔 행동에 대한 L1 Loss 계산
         loss_arm_per_element = F.l1_loss(pred_arm, true_arm, reduction='none')
 
-        # 그리퍼 행동에 대한 BCE Loss 계산
-        true_gripper_bce = (true_gripper + 1.0) / 2.0  # 정답을 -1/1에서 0/1로 변환
+        true_gripper_bce = (true_gripper + 1.0) / 2.0
         loss_gripper_per_element = F.binary_cross_entropy_with_logits(
             pred_gripper_logit, true_gripper_bce, reduction='none'
         )
 
-        # 패딩 마스크를 적용하여 '가짜' 데이터에 대한 손실은 0으로 만듦
         mask = ~pad_mask
         loss_arm_per_element *= mask.unsqueeze(-1)
         loss_gripper_per_element *= mask.unsqueeze(-1)
 
-        # 패딩을 제외한 실제 데이터에 대해서만 평균 손실 계산
         num_valid_elements = mask.sum()
         losses['forward_action_loss_arm'] = loss_arm_per_element.sum() / \
             (num_valid_elements * 6 + 1e-8)
         losses['forward_action_loss_gripper'] = loss_gripper_per_element.sum(
         ) / (num_valid_elements * 1 + 1e-8)
 
-    # 3. State Prediction Loss (Backward Plan)
-    if 'predicted_backward_states' in predictions and 'backward_states' in targets:
-        losses['backward_state_loss'] = F.l1_loss(
-            predictions['predicted_backward_states'], targets['backward_states'])
-
-    # 4. Progress Prediction Loss
-    if 'predicted_progress' in predictions and 'normalized_timestep' in targets:
-        predicted = predictions['predicted_progress'].squeeze(-1)
-        target = targets['normalized_timestep']
-        losses['progress_loss'] = F.mse_loss(predicted, target)
-
-    # 전체 가중치 합산 손실 계산
     total_loss = torch.tensor(0.0, device=next(
         iter(predictions.values())).device)
     for name, loss in losses.items():
-        if name in weights and loss.numel() > 0:
+        if name in weights and loss is not None and loss.numel() > 0:
             total_loss += loss * weights.get(name, 1.0)
     losses['total_loss'] = total_loss
-
     return losses
 
 
@@ -150,7 +148,13 @@ class HierarchicalAutoregressivePolicy(nn.Module):
 
         # --- Prediction Heads ---
         mlp_hidden_dim = h_cfg.hidden_dim // 2
-        self.goal_head = nn.Linear(h_cfg.hidden_dim, v_cfg.image_latent_dim)
+        # --- 예측 헤드 ---
+        # [MODIFIED] Create two separate prediction heads for goal latents
+        self.goal_head_front = nn.Linear(
+            h_cfg.hidden_dim, v_cfg.image_latent_dim)
+        self.goal_head_wrist = nn.Linear(
+            h_cfg.hidden_dim, v_cfg.image_latent_dim)
+
         self.bwd_head = nn.Sequential(
             nn.Linear(h_cfg.hidden_dim, mlp_hidden_dim),
             nn.ReLU(),
@@ -238,11 +242,16 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         pred_arm = self.action_decoder_arm_head(shared_features)
         pred_gripper_logit = self.action_decoder_gripper_head(shared_features)
         pred_fwd_actions = torch.cat([pred_arm, pred_gripper_logit], dim=-1)
+        pred_latent_front = self.goal_head_front(goal_h)
+        pred_latent_wrist = self.goal_head_wrist(goal_h)
+        pred_img_front, pred_img_wrist = self.image_decoder(
+            pred_latent_front, pred_latent_wrist)
 
         preds = {
             "predicted_backward_states": pred_bwd_states,
-            "predicted_action": pred_fwd_actions,
-            "predicted_goal_images": self.image_decoder(self.goal_head(goal_h)),
+            "predicted_forward_actions": pred_fwd_actions,
+            "predicted_goal_image_front": pred_img_front,
+            "predicted_goal_image_wrist": pred_img_wrist,
             "predicted_progress": torch.sigmoid(self.progress_head(prog_h)),
         }
         return preds
@@ -251,3 +260,40 @@ class HierarchicalAutoregressivePolicy(nn.Module):
     def generate(self, initial_images, initial_states, language_instruction) -> Dict[str, torch.Tensor]:
         # This would need a proper inference-time implementation now
         return self.forward(initial_images, initial_states, language_instruction)
+
+    @torch.no_grad()
+    def select_action(self, observation_dict: dict) -> torch.Tensor:
+        """
+        오직 평가(inference) 시에만 사용되는 함수.
+        관측값을 받아, 필요시 재계획(re-plan)하고, 다음 행동을 반환합니다.
+        """
+        self.eval()
+        device = next(self.parameters()).device
+
+        for key, value in observation_dict.items():
+            if isinstance(value, torch.Tensor) and value.ndim in [1, 3, 4]:
+                observation_dict[key] = value.unsqueeze(0).to(device)
+
+        normalized_obs = self.normalize_inputs(observation_dict)
+        self.observation_queue.append({
+            "observation.image": normalized_obs["observation.image"].squeeze(0),
+            "observation.state": normalized_obs["observation.state"].squeeze(0),
+        })
+
+        if len(self.observation_queue) < self.config.data.n_obs_steps:
+            return torch.zeros(self.output_features["action"].shape[-1], device=device)
+
+        if not self.action_queue:
+            model_input_batch = {
+                "initial_images": torch.stack([obs["observation.image"] for obs in self.observation_queue]).unsqueeze(0),
+                "initial_states": torch.stack([obs["observation.state"] for obs in self.observation_queue]).unsqueeze(0),
+                "language_instruction": observation_dict["language_instruction"]
+            }
+            predictions = self.forward(**model_input_batch)
+            actions_normalized = predictions['predicted_forward_actions']
+            actions_denormalized = self.unnormalize_outputs(
+                {"action": actions_normalized})["action"]
+            for i in range(actions_denormalized.shape[1]):
+                self.action_queue.append(actions_denormalized.squeeze(0)[i])
+
+        return self.action_queue.popleft()

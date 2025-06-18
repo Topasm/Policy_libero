@@ -39,8 +39,8 @@ class HierarchicalTransformerConfig:
     num_layers: int = 12
     num_heads: int = 12    # Seer uses 12
     dropout: float = 0.1
-    forward_steps: int = 16
-    backward_steps: int = 16
+    forward_steps: int = 64
+    backward_steps: int = 64
     num_goal_tokens: int = 1
     num_bwd_tokens: int = 1
     num_fwd_tokens: int = 1
@@ -63,7 +63,7 @@ class DataConfig:
                                   "observation.images.image", "observation.images.wrist_image"])
     n_obs_steps: int = 7       # Seer uses a history length of 7 for LIBERO
     horizon: int = 16
-    n_action_steps: int = 16
+    n_action_steps: int = 64
     diffusion_target_key: str = "observation.state"
     interpolate_state: bool = True
     state_delta_indices: List[int] = field(
