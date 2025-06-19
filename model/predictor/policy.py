@@ -31,35 +31,28 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
         'forward_action_loss_arm': 1.0,
         'forward_action_loss_gripper': 0.01,
         'backward_state_loss': 1.0,
-        'goal_image_loss': 1.0,  # This will be the sum of both image losses
-        'progress_loss': 0.5
+        'goal_image_loss': 1.0,
+        'goal_progress_loss': 0.3,
+        'backward_progress_loss': 0.3,
+        'forward_progress_loss': 0.3,
     }
 
-    # [MODIFIED] Calculate loss for both front and wrist goal images
+    # Goal image loss (both front and wrist)
     if 'predicted_goal_image_front' in predictions and 'goal_images' in targets:
         pred_front = predictions['predicted_goal_image_front']
         pred_wrist = predictions['predicted_goal_image_wrist']
-
         true_front = targets['goal_images'][:, 0]
         true_wrist = targets['goal_images'][:, 1]
-
         loss_front = F.mse_loss(pred_front, true_front)
         loss_wrist = F.mse_loss(pred_wrist, true_wrist)
         losses['goal_image_loss'] = loss_front + loss_wrist
 
-    # State Prediction Loss (Backward Plan)
+    # Backward state loss
     if 'predicted_backward_states' in predictions and 'backward_states' in targets:
-        # Assuming backward states do not need padding mask, or a separate one would be needed
         losses['backward_state_loss'] = F.l1_loss(
             predictions['predicted_backward_states'], targets['backward_states'])
 
-    # Progress Prediction Loss
-    if 'predicted_progress' in predictions and 'normalized_timestep' in targets:
-        predicted = predictions['predicted_progress'].squeeze(-1)
-        target = targets['normalized_timestep']
-        losses['progress_loss'] = F.mse_loss(predicted, target)
-
-    # [MODIFIED] Calculate loss for forward ACTIONS
+    # Forward action loss
     if 'predicted_forward_actions' in predictions and 'action' in targets:
         pred_actions = predictions['predicted_forward_actions']
         true_actions = targets['action'][:, :pred_actions.shape[1]]
@@ -70,7 +63,6 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
         true_arm, true_gripper = true_actions[..., :6], true_actions[..., 6:]
 
         loss_arm_per_element = F.l1_loss(pred_arm, true_arm, reduction='none')
-
         true_gripper_bce = (true_gripper + 1.0) / 2.0
         loss_gripper_per_element = F.binary_cross_entropy_with_logits(
             pred_gripper_logit, true_gripper_bce, reduction='none'
@@ -86,6 +78,29 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
         losses['forward_action_loss_gripper'] = loss_gripper_per_element.sum(
         ) / (num_valid_elements * 1 + 1e-8)
 
+    # Progress prediction losses for each query
+    if 'normalized_timestep' in targets:
+        target_progress = targets['normalized_timestep']
+
+        if 'goal_predicted_progress' in predictions:
+            predicted_goal_progress = predictions['goal_predicted_progress'].squeeze(
+                -1)
+            losses['goal_progress_loss'] = F.mse_loss(
+                predicted_goal_progress, target_progress)
+
+        if 'backward_predicted_progress' in predictions:
+            predicted_bwd_progress = predictions['backward_predicted_progress'].squeeze(
+                -1)
+            losses['backward_progress_loss'] = F.mse_loss(
+                predicted_bwd_progress, target_progress)
+
+        if 'forward_predicted_progress' in predictions:
+            predicted_fwd_progress = predictions['forward_predicted_progress'].squeeze(
+                -1)
+            losses['forward_progress_loss'] = F.mse_loss(
+                predicted_fwd_progress, target_progress)
+
+    # Calculate total loss
     total_loss = torch.tensor(0.0, device=next(
         iter(predictions.values())).device)
     for name, loss in losses.items():
@@ -117,8 +132,7 @@ class HierarchicalAutoregressivePolicy(nn.Module):
             vit_hidden_size, h_cfg.hidden_dim)
         self.cls_token_projector = nn.Linear(vit_hidden_size, h_cfg.hidden_dim)
 
-        # --- Queries for Hierarchical, End-to-End Prediction ---
-        self.progress_query = nn.Parameter(torch.randn(1, 1, h_cfg.hidden_dim))
+        # --- Queries for Hierarchical, End-to-End Prediction (REMOVED progress_query) ---
         self.goal_query = nn.Parameter(torch.randn(
             1, h_cfg.num_goal_tokens, h_cfg.hidden_dim))
         self.bwd_query = nn.Parameter(torch.randn(
@@ -131,7 +145,8 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         num_state_tokens = d_cfg.n_obs_steps
         num_image_tokens = d_cfg.n_obs_steps * \
             (v_cfg.num_query_per_image * len(d_cfg.image_keys) + 2)
-        num_query_tokens = 1 + h_cfg.num_goal_tokens + \
+        # REMOVED progress query from count
+        num_query_tokens = h_cfg.num_goal_tokens + \
             h_cfg.backward_steps + d_cfg.n_action_steps
         max_len = num_lang_tokens + num_state_tokens + \
             num_image_tokens + num_query_tokens + 16
@@ -148,8 +163,16 @@ class HierarchicalAutoregressivePolicy(nn.Module):
 
         # --- Prediction Heads ---
         mlp_hidden_dim = h_cfg.hidden_dim // 2
-        # --- 예측 헤드 ---
-        # [MODIFIED] Create two separate prediction heads for goal latents
+
+        # Shared progress head for all queries
+        self.progress_head = nn.Sequential(
+            nn.Linear(h_cfg.hidden_dim, mlp_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(mlp_hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+        # Goal prediction heads
         self.goal_head_front = nn.Linear(
             h_cfg.hidden_dim, v_cfg.image_latent_dim)
         self.goal_head_wrist = nn.Linear(
@@ -161,8 +184,6 @@ class HierarchicalAutoregressivePolicy(nn.Module):
             nn.Linear(mlp_hidden_dim, mlp_hidden_dim),
             nn.ReLU(),
             nn.Linear(mlp_hidden_dim, h_cfg.state_dim))
-        # Progress Head (single output for progress predictio
-        self.progress_head = nn.Linear(h_cfg.hidden_dim, 1)
 
         self.action_decoder_body = nn.Sequential(
             nn.Linear(h_cfg.hidden_dim, mlp_hidden_dim),
@@ -197,11 +218,10 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         lang_embed = self.language_encoder(language_instruction).unsqueeze(1)
         lang_embed_proj = self.lang_projection(lang_embed)
 
-        # 2. Assemble the full sequence
+        # 2. Assemble the full sequence (REMOVED progress_query)
         history_embeds = torch.cat(
             [lang_embed_proj, state_embeds, img_embeds], dim=1)
         query_embeds = torch.cat([
-            self.progress_query.expand(batch_size, -1, -1),
             self.goal_query.expand(batch_size, -1, -1),
             self.bwd_query.expand(batch_size, -1, -1),
             self.action_query.expand(batch_size, -1, -1)
@@ -209,19 +229,18 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         seq = torch.cat([history_embeds, query_embeds], dim=1)
         seq = seq + self.pos_embed[:, :seq.shape[1], :]
 
-        # 3. Create the custom attention mask
+        # 3. Create the custom attention mask (UPDATED indices)
         seq_len = seq.shape[1]
         mask = torch.ones(seq_len, seq_len, device=seq.device,
                           dtype=torch.bool).triu(1)
 
         hist_len = history_embeds.size(1)
-        prog_start = hist_len
-        goal_start = prog_start + 1
+        goal_start = hist_len
         bwd_start = goal_start + h_cfg.num_goal_tokens
         action_start = bwd_start + h_cfg.backward_steps
 
-        mask[prog_start:, :hist_len] = False
-        mask[goal_start:, prog_start:goal_start] = False
+        # Updated mask logic without progress query
+        mask[goal_start:, :hist_len] = False
         mask[bwd_start:, goal_start:bwd_start] = False
         mask[action_start:, bwd_start:bwd_start] = False  # Action also sees Bwd
         # Action also sees Goal
@@ -230,13 +249,12 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         # 4. Pass through the backbone
         out = self.multi_modal_backbone(seq, mask=mask)
 
-        # 5. Slice outputs
-        prog_h = out[:, prog_start:goal_start].mean(dim=1)
+        # 5. Slice outputs (UPDATED indices)
         goal_h = out[:, goal_start:bwd_start].mean(dim=1)
         bwd_h_sequence = out[:, bwd_start:action_start]
         action_h_sequence = out[:, action_start:]
 
-        # --- [MODIFIED] Generate final predictions ---
+        # --- Generate final predictions with progress for each query ---
         pred_bwd_states = self.bwd_head(bwd_h_sequence)
         shared_features = self.action_decoder_body(action_h_sequence)
         pred_arm = self.action_decoder_arm_head(shared_features)
@@ -247,12 +265,19 @@ class HierarchicalAutoregressivePolicy(nn.Module):
         pred_img_front, pred_img_wrist = self.image_decoder(
             pred_latent_front, pred_latent_wrist)
 
+        # Progress predictions for each query
+        goal_progress = self.progress_head(goal_h)
+        bwd_progress = self.progress_head(bwd_h_sequence.mean(dim=1))
+        action_progress = self.progress_head(action_h_sequence.mean(dim=1))
+
         preds = {
             "predicted_backward_states": pred_bwd_states,
             "predicted_forward_actions": pred_fwd_actions,
             "predicted_goal_image_front": pred_img_front,
             "predicted_goal_image_wrist": pred_img_wrist,
-            "predicted_progress": torch.sigmoid(self.progress_head(prog_h)),
+            "goal_predicted_progress": goal_progress,
+            "backward_predicted_progress": bwd_progress,
+            "forward_predicted_progress": action_progress,
         }
         return preds
 
