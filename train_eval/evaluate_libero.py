@@ -52,7 +52,7 @@ def _quat2axisangle(quat):
 @dataclass
 class EvalConfig:
     # --- 필수 설정 ---
-    planner_checkpoint_path: str = "outputs/train/bidirectional_transformere/model_step_870.pth"
+    planner_checkpoint_path: str = "outputs/train/bidirectional_transformerl/model_final.pth"
 
     # --- LIBERO 벤치마크 설정 ---
     benchmark_name: str = "libero_object"
