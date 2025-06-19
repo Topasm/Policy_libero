@@ -43,6 +43,16 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
         pred_wrist = predictions['predicted_goal_image_wrist']
         true_front = targets['goal_images'][:, 0]
         true_wrist = targets['goal_images'][:, 1]
+
+        # Handle size mismatches with interpolation
+        if pred_front.shape[2:] != true_front.shape[2:]:
+            true_front = F.interpolate(
+                true_front, size=pred_front.shape[2:], mode='bilinear', align_corners=False)
+
+        if pred_wrist.shape[2:] != true_wrist.shape[2:]:
+            true_wrist = F.interpolate(
+                true_wrist, size=pred_wrist.shape[2:], mode='bilinear', align_corners=False)
+
         loss_front = F.mse_loss(pred_front, true_front)
         loss_wrist = F.mse_loss(pred_wrist, true_wrist)
         losses['goal_image_loss'] = loss_front + loss_wrist
@@ -285,40 +295,3 @@ class HierarchicalAutoregressivePolicy(nn.Module):
     def generate(self, initial_images, initial_states, language_instruction) -> Dict[str, torch.Tensor]:
         # This would need a proper inference-time implementation now
         return self.forward(initial_images, initial_states, language_instruction)
-
-    @torch.no_grad()
-    def select_action(self, observation_dict: dict) -> torch.Tensor:
-        """
-        오직 평가(inference) 시에만 사용되는 함수.
-        관측값을 받아, 필요시 재계획(re-plan)하고, 다음 행동을 반환합니다.
-        """
-        self.eval()
-        device = next(self.parameters()).device
-
-        for key, value in observation_dict.items():
-            if isinstance(value, torch.Tensor) and value.ndim in [1, 3, 4]:
-                observation_dict[key] = value.unsqueeze(0).to(device)
-
-        normalized_obs = self.normalize_inputs(observation_dict)
-        self.observation_queue.append({
-            "observation.image": normalized_obs["observation.image"].squeeze(0),
-            "observation.state": normalized_obs["observation.state"].squeeze(0),
-        })
-
-        if len(self.observation_queue) < self.config.data.n_obs_steps:
-            return torch.zeros(self.output_features["action"].shape[-1], device=device)
-
-        if not self.action_queue:
-            model_input_batch = {
-                "initial_images": torch.stack([obs["observation.image"] for obs in self.observation_queue]).unsqueeze(0),
-                "initial_states": torch.stack([obs["observation.state"] for obs in self.observation_queue]).unsqueeze(0),
-                "language_instruction": observation_dict["language_instruction"]
-            }
-            predictions = self.forward(**model_input_batch)
-            actions_normalized = predictions['predicted_forward_actions']
-            actions_denormalized = self.unnormalize_outputs(
-                {"action": actions_normalized})["action"]
-            for i in range(actions_denormalized.shape[1]):
-                self.action_queue.append(actions_denormalized.squeeze(0)[i])
-
-        return self.action_queue.popleft()
